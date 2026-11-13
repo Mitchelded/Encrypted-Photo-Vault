@@ -17,6 +17,48 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.13'
+      - name: Bundle offline NSFW model for grid labels
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p android/vector-bridge/src/main/assets
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, shutil, subprocess, zipfile
+          model = Path("android/vector-bridge/src/main/assets/nsfw.tflite")
+          urls = [
+              "https://media.githubusercontent.com/media/getknit/knit/main/app/src/main/assets/moderation/nsfw.tflite",
+              "https://github.com/getknit/knit/raw/refs/heads/main/app/src/main/assets/moderation/nsfw.tflite",
+          ]
+          expected = "380f98f7685f9d8a386f8cc595b6dfcb972989aae3d1b8b270d3a4a5b96fab40"
+          for url in urls:
+              try:
+                  subprocess.run(["curl", "-fLsS", "--retry", "2", "--max-time", "120",
+                                  "-o", str(model), url], check=True)
+                  data = model.read_bytes()
+                  if len(data) > 16_000_000 and data[4:8] == b"TFL3":
+                      break
+              except subprocess.CalledProcessError:
+                  pass
+          else:
+              archive = Path("/tmp/epv-nsfw-release.zip")
+              subprocess.run([
+                  "curl", "-fLsS", "--retry", "3", "--max-time", "240",
+                  "-o", str(archive),
+                  "https://github.com/GantMan/nsfw_model/releases/download/1.1.0/nsfw_mobilenet_v2_140_224.zip"
+              ], check=True)
+              with zipfile.ZipFile(archive) as z:
+                  names = [n for n in z.namelist() if n.lower().endswith(".tflite")]
+                  assert names, "Release does not include TFLite"
+                  with z.open(names[0]) as src, model.open("wb") as dst:
+                      shutil.copyfileobj(src, dst)
+              data = model.read_bytes()
+          got = hashlib.sha256(data).hexdigest()
+          assert got == expected, f"Unexpected model SHA256: {got}"
+          assert len(data) > 16_000_000 and data[4:8] == b"TFL3"
+          shutil.copyfile("MODEL_LICENSE.md", "android/vector-bridge/src/main/assets/MODEL_LICENSE.md")
+          print(f"Offline NSFW model verified: {len(data)} bytes, SHA256={got}")
+          PY
       - name: Build Vector Xposed module
         run: gradle -p android :vector-bridge:assembleDebug --stacktrace
       - name: Verify Xposed module metadata
@@ -28,6 +70,8 @@ jobs:
               entry = archive.read("assets/xposed_init").decode().strip()
               assert entry == "io.github.epv.vectorbridge.PhotosHook", entry
               assert "classes.dex" in archive.namelist(), "Missing Xposed module dex"
+              assert len(archive.read("assets/nsfw.tflite")) > 16_000_000, "Offline NSFW model missing"
+              assert "assets/MODEL_LICENSE.md" in archive.namelist(), "Model license missing"
               print("Verified classic Xposed entry point:", entry)
           PY
       - uses: actions/upload-artifact@v4
