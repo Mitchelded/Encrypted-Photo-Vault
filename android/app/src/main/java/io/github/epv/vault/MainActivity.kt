@@ -100,6 +100,20 @@ class MainActivity : ComponentActivity() {
                 var previewTitle by remember { mutableStateOf("") }
                 val scope = rememberCoroutineScope()
                 val thumbSemaphore = remember { Semaphore(2) }
+                val notificationPermissionLauncher = rememberLauncherForActivityResult(
+                    ActivityResultContracts.RequestPermission()
+                ) { granted ->
+                    if (!granted) status = "Разрешите уведомления EPV в Android, чтобы видеть " +
+                        "состояние фонового поиска и кнопку остановки."
+                }
+                fun requestBackgroundNotification() {
+                    if (android.os.Build.VERSION.SDK_INT >= 33 &&
+                        checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+                        android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                        notificationPermissionLauncher.launch(
+                            android.Manifest.permission.POST_NOTIFICATIONS)
+                    }
+                }
                 fun startNsfwScan(folder: Uri) {
                     if (busy || ScanBackgroundState.runningMode.isNotEmpty() || password.isBlank()) {
                         status = "Введите пароль или дождитесь завершения текущей проверки"
@@ -108,6 +122,7 @@ class MainActivity : ComponentActivity() {
                     try {
                         scanStore.rememberFolder(folder, nsfwThreshold)
                         nsfwTarget = folder
+                        requestBackgroundNotification()
                         startForegroundService(Intent(this@MainActivity, NsfwScanService::class.java).apply {
                             action = NsfwScanService.START
                             putExtra("mode", NsfwScanService.ENCRYPT)
@@ -132,6 +147,7 @@ class MainActivity : ComponentActivity() {
                     }
                     try {
                         scanStore.saveMoveFolders(src, dst)
+                        requestBackgroundNotification()
                         startForegroundService(Intent(this@MainActivity, NsfwScanService::class.java).apply {
                             action = NsfwScanService.START
                             putExtra("mode", NsfwScanService.ORGANIZE)
