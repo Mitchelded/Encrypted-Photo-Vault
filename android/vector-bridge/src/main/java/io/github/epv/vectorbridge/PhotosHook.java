@@ -14,6 +14,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
+import de.robv.android.xposed.IXposedHookZygoteInit;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
@@ -25,17 +26,27 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * Google Photos internals, Photos account tokens, or the backup protocol.
  * No READ_MEDIA permissions and no automatic access to cloud photos.
  */
-public final class PhotosHook implements IXposedHookLoadPackage {
+public final class PhotosHook implements IXposedHookLoadPackage, IXposedHookZygoteInit {
     private static final String GOOGLE_PHOTOS = "com.google.android.apps.photos";
     private static final String EPV_PACKAGE = "io.github.epv.vault";
     private static final String EPV_ACTIVITY = EPV_PACKAGE + ".MainActivity";
     private static final String PANEL_TAG = "epv_vector_bridge_panel_v1";
+    private static volatile String moduleApkPath;
+
+    @Override
+    public void initZygote(StartupParam startupParam) {
+        moduleApkPath = startupParam.modulePath;
+    }
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam param) {
         if (!GOOGLE_PHOTOS.equals(param.packageName)) return;
         if (!GOOGLE_PHOTOS.equals(param.processName)) return;
 
+        // Uses only the visible PhotoCellView rendering; never queries
+        // Google's cloud API or credentials. If the cell class changes,
+        // the rest of the bridge remains usable.
+        NsfwGridBadge.install(param.classLoader, moduleApkPath);
         try {
             XposedHelpers.findAndHookMethod(Activity.class, "onResume", new XC_MethodHook() {
                 @Override
@@ -60,6 +71,7 @@ public final class PhotosHook implements IXposedHookLoadPackage {
         FrameLayout frame = (FrameLayout) decor;
         if (frame.findViewWithTag(PANEL_TAG) != null) return;
 
+        NsfwGridBadge.restoreSetting(activity);
         LinearLayout panel = new LinearLayout(activity);
         panel.setTag(PANEL_TAG);
         panel.setOrientation(LinearLayout.HORIZONTAL);
@@ -78,6 +90,20 @@ public final class PhotosHook implements IXposedHookLoadPackage {
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         second.leftMargin = dp(activity, 6);
         panel.addView(scan, second);
+
+        TextView toggleBadges = button(activity,
+                NsfwGridBadge.isEnabled(activity) ? "Метки ✓" : "Метки —");
+        toggleBadges.setContentDescription("Включить или выключить локальные метки 18+");
+        toggleBadges.setOnClickListener(v -> {
+            boolean active = NsfwGridBadge.toggle(activity);
+            toggleBadges.setText(active ? "Метки ✓" : "Метки —");
+            Toast.makeText(activity, active ? "18+ метки включены" : "18+ метки выключены",
+                    Toast.LENGTH_SHORT).show();
+        });
+        LinearLayout.LayoutParams toggleParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        toggleParams.leftMargin = dp(activity, 6);
+        panel.addView(toggleBadges, toggleParams);
 
         FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
