@@ -19,7 +19,10 @@ if ((Test-Path $keyPath) -xor (Test-Path $passwordPath)) {
     throw "Only one of the signing key/password files exists. Restore both from your backup."
 }
 if (!(Test-Path $keyPath)) {
-    $password = [Convert]::ToBase64String([System.Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    $secretBytes = New-Object byte[] 32
+    try { $rng.GetBytes($secretBytes) } finally { $rng.Dispose() }
+    $password = [Convert]::ToBase64String($secretBytes)
     & keytool -genkeypair -alias $alias -keyalg RSA -keysize 3072 -validity 3650 -keystore $keyPath -storetype PKCS12 -storepass $password -keypass $password -dname "CN=Encrypted Photo Vault,O=Mitchelded,C=US" -noprompt
     if ($LASTEXITCODE -ne 0) { throw "Key generation failed" }
     [System.IO.File]::WriteAllText($passwordPath, $password)
