@@ -111,18 +111,27 @@ class NsfwOrganizer(private val context: Context) {
         }
     }
 
+    /**
+     * Indexed, resumable organizer:
+     * 1. Only the FIRST launch enumerates the whole source tree.
+     * 2. Process persisted pending entries, never rescan at restart.
+     * 3. Once pending entries are exhausted, ONE refresh discovers new files.
+     * 4. Process newly discovered entries and exit (no endless scan loop).
+     */
     fun moveFolder(
         sourceUri: Uri, destinationUri: Uri, threshold: Float,
+        scanId: String, queue: NsfwFileQueue,
         score: (Uri) -> Float?,
         alreadyChecked: (Uri, Long, Long) -> Boolean,
         markChecked: (Uri, Long, Long) -> Unit,
         cancelled: () -> Unit,
+        onIndexing: (String, Int) -> Unit,
         onProgress: (Int, Int, String) -> Unit
     ): Result {
         val sourceRoot = DocumentFile.fromTreeUri(context, sourceUri)
             ?: error("Cannot access source folder")
         val target = DocumentFile.fromTreeUri(context, destinationUri)
-            ?: error("Cannot access target folder")
+            ?: error("Cannot access destination folder")
         require(sourceRoot.isDirectory && target.isDirectory) { "Select folders" }
         require(sourceRoot.canRead()) { "Cannot read source folder" }
         require(target.canWrite()) { "Cannot write destination folder" }
@@ -133,74 +142,157 @@ class NsfwOrganizer(private val context: Context) {
             targetDocumentId != null && documentId(sourceRoot.uri) == targetDocumentId)) {
             "Source and destination folders must differ"
         }
-        val sources = ArrayList<Source>()
-        val visited = HashSet<String>()
-        val encodedPng = Regex("EPV1_[0-9a-fA-F]{32}_[0-9]{6}\\.png", RegexOption.IGNORE_CASE)
 
-        fun scan(dir: DocumentFile, relativeDir: List<String>, depth: Int) {
-            cancelled()
-            require(depth <= 32) { "Too many nested folders" }
-            if (!visited.add(dir.uri.toString())) return
-            for (child in dir.listFiles()) {
+        val encodedPng = Regex("EPV1_[0-9a-fA-F]{32}_[0-9]{6}\\.png",
+            RegexOption.IGNORE_CASE)
+        val knownExtensions = setOf(
+            "jpg", "jpeg", "png", "webp", "gif", "bmp", "heic", "heif", "avif",
+            "mp4", "m4v", "mov", "mkv", "webm", "avi", "3gp"
+        )
+
+        fun discover(stage: String): Int {
+            val visited = HashSet<String>()
+            val batch = ArrayList<NsfwFileQueue.Entry>(160)
+            var scanned = 0
+            var added = 0
+
+            fun flush() {
+                if (batch.isEmpty()) return
                 cancelled()
-                if (child.isDirectory) {
-                    // Destination can reside within source: exclude it from scanning.
-                    if (child.uri == target.uri ||
-                        (sameProvider && targetDocumentId != null &&
-                         documentId(child.uri) == targetDocumentId)) continue
-                    val name = child.name.orEmpty()
-                    if (name.isBlank() || name == "." || name == "..") continue
-                    scan(child, relativeDir + name, depth + 1)
-                } else if (child.isFile && !encodedPng.matches(child.name.orEmpty())) {
-                    val mime = resolver.getType(child.uri).orEmpty()
-                    if (mime.startsWith("image/") || mime.startsWith("video/")) {
-                        require(sources.size < 100_000) { "100,000-file scan limit exceeded" }
-                        sources.add(Source(child, relativeDir))
+                added += queue.addDiscovered(scanId, batch)
+                batch.clear()
+            }
+
+            fun walk(dir: DocumentFile, relative: List<String>, depth: Int) {
+                cancelled()
+                require(depth <= 32) { "More than 32 nested directories" }
+                if (!visited.add(dir.uri.toString())) return
+                for (child in dir.listFiles()) {
+                    cancelled()
+                    if (child.isDirectory) {
+                        // If the destination is inside the source tree, do not
+                        // add our newly moved files back into the work queue.
+                        if (child.uri == target.uri ||
+                            (sameProvider && targetDocumentId != null &&
+                                documentId(child.uri) == targetDocumentId)) continue
+                        val name = child.name.orEmpty()
+                        if (name.isBlank() || name == "." || name == "..") continue
+                        walk(child, relative + name, depth + 1)
+                    } else if (child.isFile) {
+                        val filename = child.name.orEmpty()
+                        if (encodedPng.matches(filename)) continue
+                        val extension = filename.substringAfterLast('.', "").lowercase()
+                        // Avoid a slow ContentResolver.getType IPC for extensions
+                        // that are known media types.
+                        val isMedia = extension in knownExtensions ||
+                            (extension.isEmpty() && resolver.getType(child.uri)?.let {
+                                it.startsWith("image/") || it.startsWith("video/")
+                            } == true)
+                        if (!isMedia) continue
+                        require(scanned < 100_000) { "100,000-file limit exceeded" }
+                        batch.add(NsfwFileQueue.Entry(
+                            child.uri, relative, child.length(), child.lastModified()))
+                        scanned++
+                        if (batch.size >= 160) flush()
+                        if (scanned == 1 || scanned % 100 == 0) onIndexing(stage, scanned)
                     }
                 }
             }
+
+            onIndexing(stage, 0)
+            walk(sourceRoot, emptyList(), 0)
+            flush()
+            onIndexing(stage, scanned)
+            return added
         }
-        scan(sourceRoot, emptyList(), 0)
+
+        // If the process was killed during first indexing, the flag remains
+        // false. A resumed scan upserts already-indexed files without duplicates.
+        if (!queue.isInitialized(scanId)) {
+            discover("Первичная индексация")
+            cancelled()
+            queue.setInitialized(scanId)
+        }
+        // Do not retry failing files in an infinite loop within a single run.
+        // Failures are retried when the user runs the organizer again.
+        queue.resetFailed(scanId)
+
         var moved = 0
         var safe = 0
-        var previously = 0
+        var previously = queue.done(scanId).toInt()
         var copiedOnly = 0
         var errors = 0
         val examples = ArrayList<String>()
 
-        for ((index, source) in sources.withIndex()) {
-            cancelled()
-            val doc = source.document
-            try {
-                val length = doc.length()
-                val modified = doc.lastModified()
-                if (alreadyChecked(doc.uri, length, modified)) {
-                    previously++
-                    continue
-                }
-                onProgress(index + 1, sources.size, doc.name.orEmpty())
-                val prediction = score(doc.uri)
+        fun drain() {
+            while (true) {
                 cancelled()
-                if (prediction == null) {
-                    errors++
-                    if (examples.size < 5) examples.add(doc.name + ": unsupported or damaged")
-                } else if (prediction < threshold) {
-                    markChecked(doc.uri, length, modified)
-                    safe++
-                } else {
-                    val deleted = moveVerified(doc, target, source.relativeDir, cancelled)
-                    // A successful verified copy is also a checkpoint if
-                    // deletion was denied, to avoid duplicating on resume.
-                    markChecked(doc.uri, length, modified)
-                    if (deleted) moved++ else copiedOnly++
+                val pending = queue.nextPending(scanId)
+                if (pending.isEmpty()) return
+                for (entry in pending) {
+                    cancelled()
+                    try {
+                        val doc = DocumentFile.fromSingleUri(context, entry.uri)
+                            ?: error("Cannot resolve document URI")
+                        if (!doc.exists()) {
+                            // Already moved/deleted while EPV was stopped.
+                            queue.markDone(scanId, entry.uri)
+                            previously++
+                            continue
+                        }
+                        val size = doc.length()
+                        val modified = doc.lastModified()
+                        val total = queue.total(scanId).toInt()
+                        val current = queue.done(scanId).toInt() + 1
+                        onProgress(current, total, doc.name.orEmpty())
+                        if (alreadyChecked(entry.uri, size, modified)) {
+                            queue.markDone(scanId, entry.uri)
+                            previously++
+                            continue
+                        }
+                        val confidence = score(entry.uri)
+                        cancelled()
+                        if (confidence == null) {
+                            error("Unsupported or damaged image/video")
+                        } else if (confidence < threshold) {
+                            markChecked(entry.uri, size, modified)
+                            queue.markDone(scanId, entry.uri)
+                            safe++
+                        } else {
+                            val deleted = moveVerified(doc, target, entry.relativeDir, cancelled)
+                            // Completion is recorded only after verified copy
+                            // (and deletion when allowed).
+                            markChecked(entry.uri, size, modified)
+                            queue.markDone(scanId, entry.uri)
+                            if (deleted) moved++ else copiedOnly++
+                        }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        queue.markFailed(scanId, entry.uri)
+                        errors++
+                        if (examples.size < 5)
+                            examples.add(entry.uri.lastPathSegment + ": " + e.localizedMessage)
+                    }
                 }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                errors++
-                if (examples.size < 5) examples.add(doc.name + ": " + e.localizedMessage)
             }
         }
-        return Result(sources.size, moved, safe, previously, copiedOnly, errors, examples)
+
+        // Fast resume: NO tree enumeration while there are pending entries.
+        drain()
+        cancelled()
+
+        // Exactly one refresh after the existing queue is exhausted. In the
+        // common "mostly moved" case this directory tree is much smaller.
+        discover("Поиск новых файлов")
+        cancelled()
+        drain()
+
+        return Result(
+            total = queue.total(scanId).toInt(),
+            moved = moved, safe = safe, previouslyChecked = previously,
+            copiedNotDeleted = copiedOnly, errors = errors,
+            examples = examples
+        )
     }
 }
