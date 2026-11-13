@@ -41,12 +41,93 @@ class VaultRepository(private val context: Context) {
 
     private fun shaHex(digest: MessageDigest): String = EpvCore.hex(digest.digest())
 
-    fun encryptOne(uri: Uri, password: String, onProgress: (Int, Int) -> Unit): Int {
+    /** A folder-relative directory, never an absolute path or a traversal path. */
+    private fun safeRelativeDirectory(raw: String): String {
+        if (raw.isEmpty()) return ""
+        val segments = raw.split('/')
+        require(segments.size <= 32) { "Too many nested folders" }
+        return segments.joinToString("/") { segment ->
+            require(segment.isNotEmpty() && segment != "." && segment != "..") { "Unsafe folder path" }
+            val clean = segment.replace(Regex("[<>:\\"\\\\|?*\\x00-\\x1f]"), "_").trim(' ', '.')
+            require(clean.isNotEmpty() && clean != "." && clean != "..") { "Unsafe folder name" }
+            clean.take(120)
+        }.also { require(it.length <= 1024) { "Folder path too long" } }
+    }
+
+    data class BatchResult(val total: Int, val successful: Int, val pngCount: Int,
+                           val failures: List<String>) {
+        val failed: Int get() = total - successful
+    }
+
+    /** Encrypt every regular file in a SAF tree, including nested folders.
+     * Each original keeps its relative directory encrypted inside EPV metadata.
+     * Never recurse into our own PNG output folder.
+     */
+    fun encryptFolder(rootUri: Uri, password: String,
+                      onProgress: (Int, Int, String, Int, Int) -> Unit,
+                      checkCancelled: () -> Unit = {}): BatchResult {
+        val root = DocumentFile.fromTreeUri(context, rootUri)
+            ?: error("Cannot access selected folder")
+        require(root.isDirectory) { "Select a folder" }
+        data class Source(val uri: Uri, val name: String, val relativeDir: String)
+        val found = ArrayList<Source>()
+        val visited = HashSet<String>()
+        val encryptedPngName = Regex("EPV1_[0-9a-fA-F]{32}_[0-9]{6}\\.png", RegexOption.IGNORE_CASE)
+
+        fun scan(dir: DocumentFile, relativeDir: String, depth: Int) {
+            checkCancelled()
+            require(depth <= 32) { "Selected folder exceeds 32 nested levels" }
+            if (!visited.add(dir.uri.toString())) return
+            for (child in dir.listFiles()) {
+                checkCancelled()
+                val childName = child.name.orEmpty()
+                if (child.isDirectory) {
+                    // Avoid backing up generated PNGs if Pictures/ is selected.
+                    if (childName.equals("EncryptedPhotoVault", ignoreCase = true)) continue
+                    val nextDir = safeRelativeDirectory(
+                        if (relativeDir.isEmpty()) childName else "$relativeDir/$childName"
+                    )
+                    scan(child, nextDir, depth + 1)
+                } else if (child.isFile && !encryptedPngName.matches(childName)) {
+                    require(found.size < 100_000) { "Folder has more than 100,000 files" }
+                    found.add(Source(child.uri, childName, relativeDir))
+                }
+            }
+        }
+        // Do not recursively encrypt the export folder itself.
+        require(!root.name.equals("EncryptedPhotoVault", ignoreCase = true)) {
+            "Please select the source folder, not Pictures/EncryptedPhotoVault"
+        }
+        scan(root, "", 0)
+        var successful = 0
+        var pngCount = 0
+        val errors = ArrayList<String>()
+        for ((index, source) in found.withIndex()) {
+            checkCancelled()
+            try {
+                onProgress(index + 1, found.size, source.name, 0, 0)
+                pngCount += encryptOne(source.uri, password, { part, count ->
+                    checkCancelled()
+                    onProgress(index + 1, found.size, source.name, part, count)
+                }, source.relativeDir, checkCancelled)
+                successful++
+            } catch (e: java.util.concurrent.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (errors.size < 5) errors.add("${source.name}: ${e.localizedMessage ?: e.javaClass.simpleName}")
+            }
+        }
+        return BatchResult(found.size, successful, pngCount, errors)
+    }
+
+    fun encryptOne(uri: Uri, password: String, onProgress: (Int, Int) -> Unit,
+                   relativeDirectory: String = "", checkCancelled: () -> Unit = {}): Int {
         val md = MessageDigest.getInstance("SHA-256")
         var size = 0L
         resolver.openInputStream(uri)?.use { stream ->
             val buffer = ByteArray(1024 * 1024)
             while (true) {
+                checkCancelled()
                 val n = stream.read(buffer)
                 if (n < 0) break
                 if (n == 0) continue
@@ -56,8 +137,11 @@ class VaultRepository(private val context: Context) {
         } ?: error("Cannot open input file")
         val name = nameOf(uri).substringAfterLast('/').substringAfterLast('\\')
         val mime = resolver.getType(uri) ?: "application/octet-stream"
-        val meta = JSONObject().put("n", name).put("s", size)
-            .put("h", shaHex(md)).put("m", mime).toString()
+        val metaObject = JSONObject().put("n", name).put("s", size)
+            .put("h", shaHex(md)).put("m", mime)
+        val safeDirectory = safeRelativeDirectory(relativeDirectory)
+        if (safeDirectory.isNotEmpty()) metaObject.put("p", safeDirectory)
+        val meta = metaObject.toString()
         require(meta.toByteArray(Charsets.UTF_8).size <= EpvCore.MAX_METADATA) { "Filename too long" }
         val count = max(1, ((size + EpvCore.CHUNK_SIZE - 1) / EpvCore.CHUNK_SIZE).toInt())
         val fid = EpvCore.random(16)
@@ -67,6 +151,7 @@ class VaultRepository(private val context: Context) {
         try {
             resolver.openInputStream(uri)?.use { input ->
                 for (index in 0 until count) {
+                    checkCancelled()
                     val chunk = readChunk(input, EpvCore.CHUNK_SIZE)
                     val encrypted = EpvCore.encryptPart(key, fid, salt, index, count, meta, chunk)
                     val pngName = "EPV1_${EpvCore.hex(fid)}_${(index + 1).toString().padStart(6, '0')}.png"
@@ -167,6 +252,7 @@ class VaultRepository(private val context: Context) {
                 var originalName = ""
                 var originalSize = 0L
                 var originalSha = ""
+                var relativeDirectory = ""
                 for ((index, partFile) in ordered.withIndex()) {
                     val raw = PngCodec.read(context, partFile.uri)
                     val part = EpvCore.decryptPart(key, raw)
@@ -176,6 +262,7 @@ class VaultRepository(private val context: Context) {
                         originalName = meta.getString("n")
                         originalSize = meta.getLong("s")
                         originalSha = meta.getString("h")
+                        relativeDirectory = safeRelativeDirectory(meta.optString("p", ""))
                         require(originalSize >= 0 && originalName.isNotBlank() &&
                                 originalName == originalName.substringAfterLast('/').substringAfterLast('\\')) {
                             "Unsafe filename"
@@ -185,7 +272,8 @@ class VaultRepository(private val context: Context) {
                         val values = ContentValues().apply {
                             put(MediaStore.MediaColumns.DISPLAY_NAME, originalName)
                             put(MediaStore.MediaColumns.MIME_TYPE, meta.optString("m", "application/octet-stream"))
-                            put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/EncryptedPhotoVault/")
+                            put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/EncryptedPhotoVault/" +
+                                if (relativeDirectory.isEmpty()) "" else "$relativeDirectory/")
                             put(MediaStore.MediaColumns.IS_PENDING, 1)
                         }
                         output = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
@@ -202,7 +290,7 @@ class VaultRepository(private val context: Context) {
                 require(totalSize == originalSize && shaHex(md) == originalSha) { "SHA-256 mismatch" }
                 val ready = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
                 resolver.update(output!!, ready, null, null)
-                recovered.add(originalName)
+                recovered.add(if (relativeDirectory.isEmpty()) originalName else "$relativeDirectory/$originalName")
             } catch (t: Throwable) {
                 output?.let { resolver.delete(it, null, null) }
                 throw t
