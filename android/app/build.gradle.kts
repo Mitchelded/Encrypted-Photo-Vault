@@ -22,6 +22,35 @@ android {
         versionName = "0.6.0"
     }
 
+    // Use the same private keystore in every CI build once the repository
+    // secrets have been configured. Without it debug builds remain ephemeral.
+    val persistentStoreFile = System.getenv("EPV_SIGNING_STORE_FILE")
+    val persistentStorePassword = System.getenv("EPV_SIGNING_STORE_PASSWORD")
+    val persistentKeyAlias = System.getenv("EPV_SIGNING_KEY_ALIAS")
+    val persistentKeyPassword = System.getenv("EPV_SIGNING_KEY_PASSWORD")
+    val persistentSigningAvailable = listOf(
+        persistentStoreFile, persistentStorePassword, persistentKeyAlias,
+        persistentKeyPassword
+    ).all { !it.isNullOrBlank() }
+
+    signingConfigs {
+        if (persistentSigningAvailable) {
+            create("epvPersistent") {
+                storeFile = file(persistentStoreFile!!)
+                storePassword = persistentStorePassword!!
+                keyAlias = persistentKeyAlias!!
+                keyPassword = persistentKeyPassword!!
+            }
+        }
+    }
+    buildTypes {
+        getByName("debug") {
+            if (persistentSigningAvailable) {
+                signingConfig = signingConfigs.getByName("epvPersistent")
+            }
+        }
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
