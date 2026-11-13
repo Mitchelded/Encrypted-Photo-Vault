@@ -10,8 +10,16 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -42,8 +50,10 @@ class MainActivity : ComponentActivity() {
             MaterialTheme {
                 var password by remember { mutableStateOf("") }
                 var busy by remember { mutableStateOf(false) }
+                var nsfwThreshold by remember { mutableFloatStateOf(0.70f) }
                 var status by remember { mutableStateOf("Готово к работе. Данные не отправляются на сторонние серверы.") }
                 var galleryUri by remember { mutableStateOf<Uri?>(null) }
+                var cloudSelected by remember { mutableStateOf(false) }
                 var galleryItems by remember { mutableStateOf<List<VaultRepository.Item>>(emptyList()) }
                 var imagePreview by remember { mutableStateOf<Bitmap?>(null) }
                 var videoPreview by remember { mutableStateOf<EpvMediaDataSource?>(null) }
@@ -144,10 +154,70 @@ class MainActivity : ComponentActivity() {
                         try {
                             val items = withContext(Dispatchers.IO) { repo.gallery(folder, currentPassword) }
                             galleryUri = folder
+                            cloudSelected = false
                             galleryItems = items
                             status = "Найдено ${items.size} зашифрованных файлов"
                         } catch (t: Throwable) { status = "Ошибка галереи: ${t.localizedMessage}" }
                         finally { busy = false }
+                    }
+                }
+                val cloudPicker = rememberLauncherForActivityResult(
+                    ActivityResultContracts.PickMultipleVisualMedia(100)
+                ) { selected ->
+                    if (selected.isEmpty()) return@rememberLauncherForActivityResult
+                    if (password.isEmpty()) { status = "Введите пароль"; return@rememberLauncherForActivityResult }
+                    val currentPassword = password
+                    scope.launch {
+                        busy = true
+                        status = "Чтение выбранных PNG через Google Фото..."
+                        try {
+                            val items = withContext(Dispatchers.IO) {
+                                repo.galleryPicked(selected, currentPassword)
+                            }
+                            cloudSelected = true
+                            galleryUri = null
+                            galleryItems = items
+                            status = if (items.isEmpty())
+                                "Не найдено EPV1 PNG. Выбирайте оригинальные PNG, а не обычные фото или изменённые копии."
+                            else
+                                "Открыто из облачного выбора: ${items.size} файлов. " +
+                                "Скачивать их вручную в папку приложения не требуется."
+                        } catch (t: Throwable) {
+                            status = "Ошибка облачного выбора: ${t.localizedMessage}"
+                        } finally { busy = false }
+                    }
+                }
+                val nsfwFolderPicker = rememberLauncherForActivityResult(
+                    ActivityResultContracts.OpenDocumentTree()
+                ) { folder ->
+                    if (folder == null) return@rememberLauncherForActivityResult
+                    if (password.isEmpty()) { status = "Введите пароль"; return@rememberLauncherForActivityResult }
+                    val currentPassword = password
+                    val currentThreshold = nsfwThreshold
+                    scope.launch {
+                        busy = true
+                        status = "Запуск локальной проверки изображений и видео..."
+                        try {
+                            val result = withContext(Dispatchers.IO) {
+                                LocalNsfwClassifier(this@MainActivity).use { classifier ->
+                                    repo.encryptFolder(folder, currentPassword,
+                                        { index, count, filename, part, parts ->
+                                            runOnUiThread {
+                                                status = if (part == 0) "Проверка 18+: $index/$count — $filename"
+                                                else "Шифрование 18+: $index/$count — PNG $part/$parts"
+                                            }
+                                        },
+                                        shouldEncrypt = { uri ->
+                                            (classifier.scoreMedia(uri) ?: 0f) >= currentThreshold
+                                        })
+                                }
+                            }
+                            status = "Проверено ${result.total} файлов: зашифровано ${result.successful}, " +
+                                "пропущено ${result.skipped}, ошибок ${result.failed}. " +
+                                "PNG: ${result.pngCount}. " + result.failures.joinToString("; ")
+                        } catch (t: Throwable) {
+                            status = "Локальная проверка 18+ не выполнена: ${t.localizedMessage}"
+                        } finally { busy = false }
                     }
                 }
                 if (imagePreview != null) {
@@ -218,6 +288,22 @@ class MainActivity : ComponentActivity() {
                             modifier = Modifier.fillMaxWidth()
                         ) { Text("Выбрать папку с PNG") }
                         HorizontalDivider()
+                        HorizontalDivider()
+                        Text("Локальный фильтр 18+", style = MaterialTheme.typography.titleLarge)
+                        Text("Модель TensorFlow Lite работает только на устройстве. Для фото проверяется изображение, " +
+                             "для видео — несколько кадров. Обнаруженные файлы шифруются, оригиналы не удаляются.")
+                        Text("Порог: ${(nsfwThreshold * 100).toInt()}%")
+                        Slider(value = nsfwThreshold, onValueChange = { nsfwThreshold = it },
+                            valueRange = 0.5f..0.98f, enabled = !busy)
+                        Button(
+                            onClick = { nsfwFolderPicker.launch(null) },
+                            enabled = !busy && password.isNotEmpty(),
+                            modifier = Modifier.fillMaxWidth()
+                        ) { Text("Найти 18+ в папке и зашифровать") }
+                        Text("Результаты классификации могут быть ошибочны. Рекомендуется проверить их вручную; " +
+                             "данные не удаляются и не передаются в интернет.",
+                             style = MaterialTheme.typography.bodySmall)
+                        HorizontalDivider()
                         Text("Приватная галерея", style = MaterialTheme.typography.titleLarge)
                         Text("Выберите папку со скачанными EPV PNG. Фото показываются только в памяти, " +
                              "видео воспроизводится из зашифрованных частей без экспорта в общую папку.")
@@ -226,6 +312,137 @@ class MainActivity : ComponentActivity() {
                             enabled = !busy && password.isNotEmpty(),
                             modifier = Modifier.fillMaxWidth()
                         ) { Text("Открыть зашифрованную галерею") }
+                        Button(
+                            onClick = {
+                                cloudPicker.launch(PickVisualMediaRequest(
+                                    ActivityResultContracts.PickVisualMedia.ImageOnly))
+                            },
+                            enabled = !busy && password.isNotEmpty(),
+                            modifier = Modifier.fillMaxWidth()
+                        ) { Text("Выбрать зашифрованные PNG из Google Фото") }
+                        Text("Google позволяет читать только выбранные элементы. " +
+                             "Укажи все PNG-части нужного файла: без них восстановление невозможно. " +
+                             "Google Фото должен быть включён как облачный источник Android Photo Picker.",
+                             style = MaterialTheme.typography.bodySmall)
+                        if (galleryItems.isNotEmpty()) {
+                            Text("Моя галерея • ${galleryItems.size} файлов",
+                                style = MaterialTheme.typography.titleMedium)
+                            LazyVerticalGrid(
+                                columns = GridCells.Adaptive(132.dp),
+                                modifier = Modifier.fillMaxWidth().height(440.dp),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                items(galleryItems, key = { it.id }) { item ->
+                                    var thumb by remember(item.id, galleryUri, cloudSelected) {
+                                        mutableStateOf<Bitmap?>(null)
+                                    }
+                                    LaunchedEffect(item.id, galleryUri, cloudSelected, password) {
+                                        if (item.mime?.startsWith("image/") == true) {
+                                            val currentPassword = password
+                                            thumb = withContext(Dispatchers.IO) {
+                                                try {
+                                                    val opened = if (cloudSelected)
+                                                        repo.openPickedMedia(item.id, currentPassword)
+                                                    else
+                                                        repo.openMedia(galleryUri ?: return@withContext null,
+                                                            item.id, currentPassword)
+                                                    try {
+                                                        val bounds = BitmapFactory.Options().apply {
+                                                            inJustDecodeBounds = true
+                                                        }
+                                                        opened.inputStream().use {
+                                                            BitmapFactory.decodeStream(it, null, bounds)
+                                                        }
+                                                        val opts = BitmapFactory.Options()
+                                                        var scale = 1
+                                                        while (bounds.outWidth / scale > 280 ||
+                                                               bounds.outHeight / scale > 280) scale *= 2
+                                                        opts.inSampleSize = scale
+                                                        opened.inputStream().use {
+                                                            BitmapFactory.decodeStream(it, null, opts)
+                                                        }
+                                                    } finally { opened.close() }
+                                                } catch (_: Exception) { null }
+                                            }
+                                        }
+                                    }
+                                    Card(
+                                        Modifier.fillMaxWidth().clickable(
+                                            enabled = !busy && item.mime != null) {
+                                            val folder = galleryUri
+                                            val currentPassword = password
+                                            scope.launch {
+                                                busy = true
+                                                status = "Расшифровка предпросмотра..."
+                                                var source: EpvMediaDataSource? = null
+                                                try {
+                                                    val opened = withContext(Dispatchers.IO) {
+                                                        if (cloudSelected)
+                                                            repo.openPickedMedia(item.id, currentPassword)
+                                                        else
+                                                            repo.openMedia(folder ?: error("Выберите папку"),
+                                                                item.id, currentPassword)
+                                                    }
+                                                    source = opened
+                                                    previewTitle = opened.filename
+                                                    if (opened.mime.startsWith("image/")) {
+                                                        val bitmap = withContext(Dispatchers.IO) {
+                                                            val bounds = BitmapFactory.Options().apply {
+                                                                inJustDecodeBounds = true
+                                                            }
+                                                            opened.inputStream().use {
+                                                                BitmapFactory.decodeStream(it, null, bounds)
+                                                            }
+                                                            val opts = BitmapFactory.Options()
+                                                            var sample = 1
+                                                            while (bounds.outWidth / sample > 2048 ||
+                                                                   bounds.outHeight / sample > 2048) sample *= 2
+                                                            opts.inSampleSize = sample
+                                                            opened.inputStream().use {
+                                                                BitmapFactory.decodeStream(it, null, opts)
+                                                            }
+                                                        } ?: error("Формат изображения не поддерживается")
+                                                        opened.close()
+                                                        source = null
+                                                        imagePreview = bitmap
+                                                    } else if (opened.mime.startsWith("video/")) {
+                                                        videoPreview = opened
+                                                        source = null
+                                                    } else error("Для других форматов используйте восстановление")
+                                                    status = "Предпросмотр открыт"
+                                                } catch (t: Throwable) {
+                                                    status = "Ошибка предпросмотра: ${t.localizedMessage}"
+                                                } finally { source?.close(); busy = false }
+                                            }
+                                        }
+                                    ) {
+                                        Column(Modifier.padding(6.dp),
+                                            verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                            val bitmap = thumb
+                                            if (bitmap != null) {
+                                                Image(bitmap = bitmap.asImageBitmap(),
+                                                    contentDescription = item.name,
+                                                    modifier = Modifier.fillMaxWidth().height(104.dp),
+                                                    contentScale = ContentScale.Crop)
+                                            } else {
+                                                Box(Modifier.fillMaxWidth().height(104.dp),
+                                                    contentAlignment = Alignment.Center) {
+                                                    Text(if (item.mime?.startsWith("video/") == true)
+                                                        "▶ Видео" else "▧")
+                                                }
+                                            }
+                                            Text(item.name ?: item.id.take(12),
+                                                maxLines = 2, overflow = TextOverflow.Ellipsis,
+                                                style = MaterialTheme.typography.bodySmall)
+                                            Text("${item.parts}/${item.expected} PNG",
+                                                style = MaterialTheme.typography.labelSmall)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        /* Former gallery list follows disabled in favor of tiled view.
                         galleryItems.forEach { item ->
                             Card(
                                 Modifier.fillMaxWidth().clickable(enabled = !busy && item.mime != null) {
@@ -274,6 +491,7 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
                         }
+                        */
                         if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
                         HorizontalDivider()
                         Text(status, style = MaterialTheme.typography.bodyMedium)
