@@ -442,56 +442,6 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
                         }
-                        /* Former gallery list follows disabled in favor of tiled view.
-                        galleryItems.forEach { item ->
-                            Card(
-                                Modifier.fillMaxWidth().clickable(enabled = !busy && item.mime != null) {
-                                    val folder = galleryUri ?: return@clickable
-                                    val currentPassword = password
-                                    scope.launch {
-                                        busy = true
-                                        status = "Расшифровка предпросмотра..."
-                                        var source: EpvMediaDataSource? = null
-                                        try {
-                                            val opened = withContext(Dispatchers.IO) {
-                                                repo.openMedia(folder, item.id, currentPassword)
-                                            }
-                                            source = opened
-                                            previewTitle = opened.filename
-                                            if (opened.mime.startsWith("image/")) {
-                                                val bitmap = withContext(Dispatchers.IO) {
-                                                    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                                                    opened.inputStream().use { BitmapFactory.decodeStream(it, null, bounds) }
-                                                    val opts = BitmapFactory.Options()
-                                                    var sample = 1
-                                                    while (bounds.outWidth / sample > 2048 || bounds.outHeight / sample > 2048) sample *= 2
-                                                    opts.inSampleSize = sample
-                                                    opened.inputStream().use { BitmapFactory.decodeStream(it, null, opts) }
-                                                } ?: error("Формат изображения не поддерживается")
-                                                opened.close()
-                                                source = null
-                                                imagePreview = bitmap
-                                            } else if (opened.mime.startsWith("video/")) {
-                                                videoPreview = opened
-                                                source = null
-                                            } else {
-                                                error("Встроенный просмотр предназначен для фото и видео. Для других файлов используйте восстановление.")
-                                            }
-                                            status = "Предпросмотр открыт"
-                                        } catch (t: Throwable) {
-                                            status = "Ошибка предпросмотра: ${t.localizedMessage}"
-                                        } finally { source?.close(); busy = false }
-                                    }
-                                }
-                            ) {
-                                Column(Modifier.padding(12.dp)) {
-                                    Text(item.name ?: item.id.take(12), style = MaterialTheme.typography.titleMedium)
-                                    Text("${item.parts}/${item.expected} PNG • ${item.mime ?: "недоступно"}",
-                                        style = MaterialTheme.typography.bodySmall)
-                                }
-                            }
-                        }
-                        */
                         if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
                         HorizontalDivider()
                         Text(status, style = MaterialTheme.typography.bodyMedium)
