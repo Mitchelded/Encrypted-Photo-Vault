@@ -197,6 +197,49 @@ class VaultRepository(private val context: Context) {
         return groups
     }
 
+
+    // Cloud Photo Picker grants a read URI for each photo the user selects.
+    // The provider may fetch cloud data behind the scenes; EPV does not export
+    // a decrypted copy and only retains URIs for the current app session.
+    private var pickedGroups: Map<String, List<EncodedPart>> = emptyMap()
+
+    fun galleryPicked(selected: List<Uri>, password: String): List<Item> {
+        val grouped = linkedMapOf<String, MutableList<EncodedPart>>()
+        for (uri in selected.distinct()) {
+            try {
+                val header = EpvCore.readHeader(PngCodec.read(context, uri))
+                grouped.getOrPut(header.id()) { mutableListOf() }.add(EncodedPart(uri, header))
+            } catch (_: Exception) {
+                // The selected image may not be an EPV PNG, or the picker
+                // provider may have transcoded it. Never claim it is valid.
+            }
+        }
+        pickedGroups = grouped.mapValues { it.value.toList() }
+        return pickedGroups.map { (id, parts) ->
+            val headers = parts.map { it.header }
+            val expected = headers.first().partCount
+            val unique = headers.map { it.partIndex }.distinct().size
+            if (unique != expected || parts.size != expected) {
+                Item(id, unique, expected, "Выбраны не все части (добавьте оставшиеся PNG)")
+            } else {
+                try {
+                    val opened = EpvMediaDataSource(context,
+                        parts.sortedBy { it.header.partIndex }.map { it.uri to it.header }, password)
+                    try { Item(id, unique, expected, opened.filename, opened.mime, opened.size) }
+                    finally { opened.close() }
+                } catch (_: Exception) {
+                    Item(id, unique, expected, "Не удалось расшифровать")
+                }
+            }
+        }
+    }
+
+    fun openPickedMedia(id: String, password: String): EpvMediaDataSource {
+        val group = pickedGroups[id] ?: error("Выберите части заново в Google Фото")
+        return EpvMediaDataSource(context,
+            group.sortedBy { it.header.partIndex }.map { it.uri to it.header }, password)
+    }
+
     fun inspect(rootUri: Uri): List<Item> {
         val root = DocumentFile.fromTreeUri(context, rootUri) ?: error("Cannot access folder")
         return collect(root).map { (id, parts) ->
