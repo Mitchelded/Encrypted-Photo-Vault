@@ -185,7 +185,7 @@ class NsfwOrganizer(private val context: Context) {
                         // Avoid a slow ContentResolver.getType IPC for extensions
                         // that are known media types.
                         val isMedia = extension in knownExtensions ||
-                            (extension.isEmpty() && resolver.getType(child.uri)?.let {
+                            (resolver.getType(child.uri)?.let {
                                 it.startsWith("image/") || it.startsWith("video/")
                             } == true)
                         if (!isMedia) continue
