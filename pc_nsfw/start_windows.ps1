@@ -94,7 +94,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "adb reverse failed. Check USB and device authorization."
 }
 Write-Host "Connected. Starting PC inference server (4 workers)."
-& $Python (Join-Path $Root "epv_server.py") --workers 4
+& $Python (Join-Path $Root "epv_server.py") --workers 6
 if ($LASTEXITCODE -ne 0) {
     throw "EPV inference server stopped with an error."
 }
