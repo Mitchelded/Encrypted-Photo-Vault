@@ -243,66 +243,90 @@ class NsfwOrganizer(private val context: Context) {
         val examples = ArrayList<String>()
 
         fun drain() {
+            val total = queue.total(scanId).toInt()
+            var completed = queue.done(scanId).toInt()
             while (true) {
                 cancelled()
                 val pending = queue.nextPending(scanId)
                 if (pending.isEmpty()) return
-                // The phone transmits up to 12 sampled thumbnails per batch;
-                // the PC server evaluates them with independent model workers.
+
                 for (batch in pending.chunked(if (scoreBatch == null) 1 else 12)) {
                     cancelled()
-                    // Connection failure aborts the entire scan BEFORE any file
-                    // is marked processed, instead of silently misclassifying it.
-                    val predicted = scoreBatch?.invoke(batch.map { it.uri })
-                    if (predicted != null) {
-                        check(predicted.size == batch.size) { "PC result count mismatch" }
-                    }
-                    for ((batchIndex, entry) in batch.withIndex()) {
-                    cancelled()
-                    try {
-                        val doc = DocumentFile.fromSingleUri(context, entry.uri)
-                            ?: error("Cannot resolve document URI")
-                        if (!doc.exists()) {
-                            // Already moved/deleted while EPV was stopped.
-                            queue.markDone(scanId, entry.uri)
-                            previously++
-                            continue
-                        }
-                        val size = doc.length()
-                        val modified = doc.lastModified()
-                        val total = queue.total(scanId).toInt()
-                        val current = queue.done(scanId).toInt() + 1
-                        onProgress(current, total, doc.name.orEmpty())
-                        if (alreadyChecked(entry.uri, size, modified)) {
-                            queue.markDone(scanId, entry.uri)
-                            previously++
-                            continue
-                        }
-                        val confidence = if (predicted == null) score(entry.uri)
-                            else predicted[batchIndex]
+                    // Filter checkpointed work BEFORE thumbnail decode/upload.
+                    // This is especially important when resuming 10k+ scans.
+                    val toClassify = ArrayList<NsfwFileQueue.Entry>(batch.size)
+                    for (entry in batch) {
                         cancelled()
-                        if (confidence == null) {
-                            error("Unsupported or damaged image/video")
-                        } else if (confidence < threshold) {
-                            markChecked(entry.uri, size, modified)
+                        if (alreadyChecked(entry.uri, entry.length, entry.modified)) {
                             queue.markDone(scanId, entry.uri)
-                            safe++
+                            previously++
+                            completed++
                         } else {
-                            val deleted = moveVerified(doc, target, entry.relativeDir, cancelled)
-                            // Completion is recorded only after verified copy
-                            // (and deletion when allowed).
-                            markChecked(entry.uri, size, modified)
-                            queue.markDone(scanId, entry.uri)
-                            if (deleted) moved++ else copiedOnly++
+                            toClassify.add(entry)
                         }
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (e: Exception) {
-                        queue.markFailed(scanId, entry.uri)
-                        errors++
-                        if (examples.size < 5)
-                            examples.add(entry.uri.lastPathSegment + ": " + e.localizedMessage)
                     }
+                    if (toClassify.isEmpty()) continue
+
+                    val predicted = scoreBatch?.invoke(toClassify.map { it.uri })
+                    if (predicted != null) {
+                        check(predicted.size == toClassify.size) { "PC result count mismatch" }
+                    }
+                    for ((batchIndex, entry) in toClassify.withIndex()) {
+                        cancelled()
+                        val displayName = entry.uri.lastPathSegment.orEmpty()
+                            .substringAfterLast('/').substringAfterLast(':')
+                        onProgress(completed + 1, total, displayName)
+                        try {
+                            // The initial directory cursor already supplied size and
+                            // mtime. Avoid 3-4 fresh DocumentsProvider IPC calls per
+                            // non-NSFW image; validate only before a destructive move.
+                            val confidence = if (predicted == null) score(entry.uri)
+                                else predicted[batchIndex]
+                            cancelled()
+                            if (confidence == null) {
+                                val doc = DocumentFile.fromSingleUri(context, entry.uri)
+                                    ?: error("Cannot resolve file")
+                                if (!doc.exists()) {
+                                    queue.markDone(scanId, entry.uri)
+                                    previously++
+                                    completed++
+                                    continue
+                                }
+                                error("Unsupported or damaged image/video")
+                            } else if (confidence < threshold) {
+                                markChecked(entry.uri, entry.length, entry.modified)
+                                queue.markDone(scanId, entry.uri)
+                                completed++
+                                safe++
+                            } else {
+                                val doc = DocumentFile.fromSingleUri(context, entry.uri)
+                                    ?: error("Cannot resolve document URI")
+                                if (!doc.exists()) {
+                                    queue.markDone(scanId, entry.uri)
+                                    previously++
+                                    completed++
+                                    continue
+                                }
+                                // Prevent a changed/replaced source being deleted
+                                // because of a score computed on previous content.
+                                if ((entry.length > 0 && doc.length() != entry.length) ||
+                                    (entry.modified > 0 && doc.lastModified() != entry.modified)) {
+                                    error("Source changed while scanning; retry later")
+                                }
+                                val deleted = moveVerified(doc, target, entry.relativeDir, cancelled)
+                                markChecked(entry.uri, entry.length, entry.modified)
+                                queue.markDone(scanId, entry.uri)
+                                completed++
+                                if (deleted) moved++ else copiedOnly++
+                            }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            queue.markFailed(scanId, entry.uri)
+                            errors++
+                            if (examples.size < 5)
+                                examples.add(displayName + ": " + e.localizedMessage)
+                        }
                     }
                 }
             }
