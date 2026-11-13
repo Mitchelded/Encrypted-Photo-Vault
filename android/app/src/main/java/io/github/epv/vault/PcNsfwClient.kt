@@ -3,6 +3,7 @@ package io.github.epv.vault
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.ImageDecoder
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.util.Base64
@@ -24,10 +25,10 @@ import java.util.concurrent.TimeoutException
 class PcNsfwClient(private val context: Context, private val secret: String) : Closeable {
     companion object {
         private const val BASE = "http://127.0.0.1:8765"
-        const val MAX_BATCH = 12
+        const val MAX_BATCH = 16
     }
 
-    private val pool = Executors.newFixedThreadPool(3) { task ->
+    private val pool = Executors.newFixedThreadPool(4) { task ->
         Thread(task, "EPV-Preview").apply { isDaemon = true }
     }
     @Volatile private var closed = false
@@ -78,6 +79,21 @@ class PcNsfwClient(private val context: Context, private val secret: String) : C
         val video = mime.startsWith("video/") ||
             extension in setOf("mp4","mkv","m4v","mov","avi","webm","3gp")
         if (image) {
+            // ImageDecoder requests final dimensions in one provider read.
+            // The older BitmapFactory path opens every original twice
+            // (bounds + pixels), a bottleneck for 10,000 SAF documents.
+            val preview = try {
+                ImageDecoder.decodeBitmap(
+                    ImageDecoder.createSource(resolver, uri)
+                ) { decoder, _, _ ->
+                    decoder.setAllocator(ImageDecoder.ALLOCATOR_SOFTWARE)
+                    decoder.setTargetSize(224, 224)
+                }
+            } catch (_: Exception) { null }
+            if (preview != null) {
+                return try { listOf(jpeg(preview)) } finally { preview.recycle() }
+            }
+            // Fallback for document providers not supported by ImageDecoder.
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
             if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return emptyList()
