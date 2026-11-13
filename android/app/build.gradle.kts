@@ -18,8 +18,8 @@ android {
         applicationId = "io.github.epv.vault"
         minSdk = 29
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.2.0"
+        versionCode = 3
+        versionName = "0.3.0"
     }
 
     compileOptions {
@@ -37,4 +37,5 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.13.0")
     implementation("androidx.documentfile:documentfile:1.1.0")
     implementation("org.bouncycastle:bcprov-jdk18on:1.83")
+    implementation("org.tensorflow:tensorflow-lite:2.17.0")
 }
