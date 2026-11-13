@@ -122,6 +122,7 @@ class NsfwOrganizer(private val context: Context) {
         sourceUri: Uri, destinationUri: Uri, threshold: Float,
         scanId: String, queue: NsfwFileQueue,
         score: (Uri) -> Float?,
+        scoreBatch: ((List<Uri>) -> List<Float?>)? = null,
         alreadyChecked: (Uri, Long, Long) -> Boolean,
         markChecked: (Uri, Long, Long) -> Unit,
         cancelled: () -> Unit,
@@ -229,7 +230,17 @@ class NsfwOrganizer(private val context: Context) {
                 cancelled()
                 val pending = queue.nextPending(scanId)
                 if (pending.isEmpty()) return
-                for (entry in pending) {
+                // The phone transmits up to 12 sampled thumbnails per batch;
+                // the PC server evaluates them with independent model workers.
+                for (batch in pending.chunked(if (scoreBatch == null) 1 else 12)) {
+                    cancelled()
+                    // Connection failure aborts the entire scan BEFORE any file
+                    // is marked processed, instead of silently misclassifying it.
+                    val predicted = scoreBatch?.invoke(batch.map { it.uri })
+                    if (predicted != null) {
+                        check(predicted.size == batch.size) { "PC result count mismatch" }
+                    }
+                    for ((batchIndex, entry) in batch.withIndex()) {
                     cancelled()
                     try {
                         val doc = DocumentFile.fromSingleUri(context, entry.uri)
@@ -250,7 +261,8 @@ class NsfwOrganizer(private val context: Context) {
                             previously++
                             continue
                         }
-                        val confidence = score(entry.uri)
+                        val confidence = if (predicted == null) score(entry.uri)
+                            else predicted[batchIndex]
                         cancelled()
                         if (confidence == null) {
                             error("Unsupported or damaged image/video")
@@ -273,6 +285,7 @@ class NsfwOrganizer(private val context: Context) {
                         errors++
                         if (examples.size < 5)
                             examples.add(entry.uri.lastPathSegment + ": " + e.localizedMessage)
+                    }
                     }
                 }
             }
