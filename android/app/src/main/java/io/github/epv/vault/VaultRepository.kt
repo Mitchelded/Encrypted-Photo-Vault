@@ -55,8 +55,9 @@ class VaultRepository(private val context: Context) {
     }
 
     data class BatchResult(val total: Int, val successful: Int, val pngCount: Int,
-                           val failures: List<String>, val skipped: Int = 0) {
-        val failed: Int get() = total - successful - skipped
+                           val failures: List<String>, val skipped: Int = 0,
+                           val previouslyProcessed: Int = 0) {
+        val failed: Int get() = total - successful - skipped - previouslyProcessed
     }
 
     /** Encrypt every regular file in a SAF tree, including nested folders.
@@ -66,7 +67,9 @@ class VaultRepository(private val context: Context) {
     fun encryptFolder(rootUri: Uri, password: String,
                       onProgress: (Int, Int, String, Int, Int) -> Unit,
                       checkCancelled: () -> Unit = {},
-                      shouldEncrypt: (Uri) -> Boolean = { true }): BatchResult {
+                      shouldEncrypt: (Uri) -> Boolean = { true },
+                      alreadyProcessed: (Uri, Long, Long) -> Boolean = { _, _, _ -> false },
+                      onProcessed: (Uri, Long, Long) -> Unit = { _, _, _ -> }): BatchResult {
         val root = DocumentFile.fromTreeUri(context, rootUri)
             ?: error("Cannot access selected folder")
         require(root.isDirectory) { "Select a folder" }
@@ -103,16 +106,34 @@ class VaultRepository(private val context: Context) {
         var successful = 0
         var pngCount = 0
         var skipped = 0
+        var previouslyProcessed = 0
         val errors = ArrayList<String>()
         for ((index, source) in found.withIndex()) {
             checkCancelled()
             try {
+                // SAF document metadata is used only to detect changed files.
+                val doc = DocumentFile.fromSingleUri(context, source.uri)
+                val size = doc?.length() ?: 0L
+                val modified = doc?.lastModified() ?: 0L
+                if (alreadyProcessed(source.uri, size, modified)) {
+                    previouslyProcessed++
+                    continue
+                }
                 onProgress(index + 1, found.size, source.name, 0, 0)
-                if (!shouldEncrypt(source.uri)) { skipped++; continue }
-                pngCount += encryptOne(source.uri, password, { part, count ->
+                if (!shouldEncrypt(source.uri)) {
+                    checkCancelled()
+                    onProcessed(source.uri, size, modified)
+                    skipped++
+                    continue
+                }
+                val created = encryptOne(source.uri, password, { part, count ->
                     checkCancelled()
                     onProgress(index + 1, found.size, source.name, part, count)
                 }, source.relativeDir, checkCancelled)
+                // Commit receipt only after every part of this file was written.
+                // Never checkpoint an interrupted or failed encryption.
+                onProcessed(source.uri, size, modified)
+                pngCount += created
                 successful++
             } catch (e: java.util.concurrent.CancellationException) {
                 throw e
@@ -120,7 +141,7 @@ class VaultRepository(private val context: Context) {
                 if (errors.size < 5) errors.add("${source.name}: ${e.localizedMessage ?: e.javaClass.simpleName}")
             }
         }
-        return BatchResult(found.size, successful, pngCount, errors, skipped)
+        return BatchResult(found.size, successful, pngCount, errors, skipped, previouslyProcessed)
     }
 
     fun encryptOne(uri: Uri, password: String, onProgress: (Int, Int) -> Unit,
