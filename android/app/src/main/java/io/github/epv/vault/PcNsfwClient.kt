@@ -114,7 +114,11 @@ class PcNsfwClient(private val context: Context, private val secret: String) : C
 
     fun scoreBatch(uris: List<Uri>, cancelled: () -> Unit): List<Float?> {
         require(uris.size in 1..MAX_BATCH)
-        val futures = uris.map { uri -> pool.submit<List<String>> { frames(uri) } }
+        val futures = uris.map { uri ->
+            pool.submit<List<String>> {
+                try { frames(uri) } catch (_: Exception) { emptyList() }
+            }
+        }
         val prepared = ArrayList<List<String>>()
         try {
             for (future in futures) {
