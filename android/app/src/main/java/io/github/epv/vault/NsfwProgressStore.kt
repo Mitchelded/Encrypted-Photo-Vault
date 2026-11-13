@@ -98,4 +98,23 @@ class NsfwProgressStore(context: Context) :
         preferences.getString("last_folder", null)?.let(Uri::parse)
 
     fun lastThreshold(): Float = preferences.getFloat("threshold", 0.70f)
+
+    /** Never share checkpoints with encryption mode or another destination. */
+    fun moveScanId(source: Uri, target: Uri, threshold: Float): String {
+        val level = (threshold * 1000f).toInt()
+        return sha256("EPV-NSFW-ORGANIZER-1|$source|$target|$level")
+    }
+
+    fun saveMoveFolders(source: Uri, target: Uri) {
+        check(preferences.edit()
+            .putString("organizer_source", source.toString())
+            .putString("organizer_target", target.toString())
+            .commit()) { "Cannot store organizer folders" }
+    }
+
+    fun lastMoveSource(): Uri? =
+        preferences.getString("organizer_source", null)?.let(Uri::parse)
+
+    fun lastMoveTarget(): Uri? =
+        preferences.getString("organizer_target", null)?.let(Uri::parse)
 }
