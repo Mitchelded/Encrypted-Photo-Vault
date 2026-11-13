@@ -178,7 +178,7 @@ def make_handler(token: str, model: Path, pool: ThreadPoolExecutor):
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="EPV PC classifier over ADB reverse (no disk image copies)")
-    parser.add_argument("--workers", type=int, default=4, help="1-8 independent CPU inference workers")
+    parser.add_argument("--workers", type=int, default=6, help="1-8 independent CPU inference workers")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--model", type=Path, default=MODEL_PATH)
     parser.add_argument("--token", help="Optional fixed auth token, 12+ characters")
