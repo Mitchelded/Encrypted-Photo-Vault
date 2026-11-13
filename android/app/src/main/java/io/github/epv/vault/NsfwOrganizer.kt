@@ -250,7 +250,7 @@ class NsfwOrganizer(private val context: Context) {
                 val pending = queue.nextPending(scanId)
                 if (pending.isEmpty()) return
 
-                for (batch in pending.chunked(if (scoreBatch == null) 1 else 12)) {
+                for (batch in pending.chunked(if (scoreBatch == null) 1 else PcNsfwClient.MAX_BATCH)) {
                     cancelled()
                     // Filter checkpointed work BEFORE thumbnail decode/upload.
                     // This is especially important when resuming 10k+ scans.
