@@ -41,6 +41,8 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 
@@ -65,6 +67,7 @@ class MainActivity : ComponentActivity() {
                 var videoPreview by remember { mutableStateOf<EpvMediaDataSource?>(null) }
                 var previewTitle by remember { mutableStateOf("") }
                 val scope = rememberCoroutineScope()
+                val thumbSemaphore = remember { Semaphore(2) }
                 val encryptPicker = rememberLauncherForActivityResult(
                     ActivityResultContracts.OpenMultipleDocuments()
                 ) { files ->
@@ -369,6 +372,7 @@ class MainActivity : ComponentActivity() {
                                         if (item.mime?.startsWith("image/") == true) {
                                             val currentPassword = password
                                             thumb = withContext(Dispatchers.IO) {
+                                                thumbSemaphore.withPermit {
                                                 try {
                                                     val opened = if (cloudSelected)
                                                         repo.openPickedMedia(item.id, currentPassword)
@@ -392,6 +396,7 @@ class MainActivity : ComponentActivity() {
                                                         }
                                                     } finally { opened.close() }
                                                 } catch (_: Exception) { null }
+                                                }
                                             }
                                         }
                                     }
