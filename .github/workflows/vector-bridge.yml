@@ -17,6 +17,31 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.13'
+      - name: Load persistent APK signing key (when configured)
+        shell: bash
+        env:
+          EPV_SIGNING_KEYSTORE_B64: ${{ secrets.EPV_SIGNING_KEYSTORE_B64 }}
+          EPV_SIGNING_SECRET_PASSWORD: ${{ secrets.EPV_SIGNING_PASSWORD }}
+          EPV_SIGNING_SECRET_ALIAS: ${{ secrets.EPV_SIGNING_ALIAS }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${EPV_SIGNING_KEYSTORE_B64}" ]]; then
+            echo "::warning::No permanent signing key: Android WILL reject updates from older debug builds."
+            exit 0
+          fi
+          if [[ -z "${EPV_SIGNING_SECRET_PASSWORD}" || -z "${EPV_SIGNING_SECRET_ALIAS}" ]]; then
+            echo "::error::Signing secrets incomplete. Run scripts/setup_signing.ps1."
+            exit 1
+          fi
+          printf '%s' "${EPV_SIGNING_KEYSTORE_B64}" | base64 --decode > "${RUNNER_TEMP}/epv-signing.p12"
+          chmod 600 "${RUNNER_TEMP}/epv-signing.p12"
+          {
+            echo "EPV_SIGNING_STORE_FILE=${RUNNER_TEMP}/epv-signing.p12"
+            echo "EPV_SIGNING_STORE_PASSWORD=${EPV_SIGNING_SECRET_PASSWORD}"
+            echo "EPV_SIGNING_KEY_PASSWORD=${EPV_SIGNING_SECRET_PASSWORD}"
+            echo "EPV_SIGNING_KEY_ALIAS=${EPV_SIGNING_SECRET_ALIAS}"
+          } >> "${GITHUB_ENV}"
+          echo "Persistent signing key restored to ephemeral runner without logging the key."
       - name: Bundle offline NSFW model for grid labels
         shell: bash
         run: |
