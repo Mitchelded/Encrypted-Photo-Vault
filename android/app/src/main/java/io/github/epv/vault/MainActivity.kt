@@ -27,6 +27,8 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 
 /**
  * EPV1 Android front-end. Directly exports RGB PNGs to Pictures/EncryptedPhotoVault,
@@ -73,6 +75,40 @@ class MainActivity : ComponentActivity() {
                         } catch (t: Throwable) {
                             status = "Ошибка шифрования: ${t.localizedMessage}"
                         } finally { busy = false }
+                    }
+                }
+                val encryptFolderPicker = rememberLauncherForActivityResult(
+                    ActivityResultContracts.OpenDocumentTree()
+                ) { folder ->
+                    if (folder == null) return@rememberLauncherForActivityResult
+                    if (password.isEmpty()) { status = "Введите пароль"; return@rememberLauncherForActivityResult }
+                    val currentPassword = password
+                    scope.launch {
+                        busy = true
+                        status = "Поиск файлов в выбранной папке..."
+                        try {
+                            val result = withContext(Dispatchers.IO) {
+                                val jobContext = currentCoroutineContext()
+                                repo.encryptFolder(folder, currentPassword, { file, total, name, part, parts ->
+                                    runOnUiThread {
+                                        status = if (part == 0)
+                                            "Шифрование $file/$total: $name"
+                                        else
+                                            "Шифрование $file/$total: $name — PNG $part/$parts"
+                                    }
+                                }, { jobContext.ensureActive() })
+                            }
+                            status = when {
+                                result.total == 0 -> "В выбранной папке нет файлов для шифрования"
+                                result.failed == 0 -> "Готово: ${result.successful} файлов → ${result.pngCount} PNG. Pictures/EncryptedPhotoVault"
+                                else -> "Зашифровано ${result.successful}/${result.total} файлов → ${result.pngCount} PNG. " +
+                                    "Ошибок: ${result.failed}. " + result.failures.joinToString("; ")
+                            }
+                        } catch (t: Throwable) {
+                            status = "Ошибка обработки папки: ${t.localizedMessage}"
+                        } finally {
+                            busy = false
+                        }
                     }
                 }
                 val restorePicker = rememberLauncherForActivityResult(
@@ -163,10 +199,19 @@ class MainActivity : ComponentActivity() {
                             enabled = !busy && password.isNotEmpty(),
                             modifier = Modifier.fillMaxWidth()
                         ) { Text("Выбрать файлы и зашифровать") }
+                        Text("Или выберите целую папку — все файлы внутри, включая подпапки, " +
+                             "будут зашифрованы по очереди. Исходные файлы не изменяются.",
+                             style = MaterialTheme.typography.bodyMedium)
+                        Button(
+                            onClick = { encryptFolderPicker.launch(null) },
+                            enabled = !busy && password.isNotEmpty(),
+                            modifier = Modifier.fillMaxWidth()
+                        ) { Text("Выбрать папку и зашифровать всё") }
                         HorizontalDivider()
                         Text("Восстановить", style = MaterialTheme.typography.titleLarge)
                         Text("Скачайте PNG из Google Фото в одну папку и укажите её. " +
-                             "Оригиналы появятся в Download/EncryptedPhotoVault.")
+                             "Оригиналы появятся в Download/EncryptedPhotoVault. " +
+                             "При шифровании папки вложенные каталоги сохраняются при восстановлении.")
                         Button(
                             onClick = { restorePicker.launch(null) },
                             enabled = !busy && password.isNotEmpty(),
