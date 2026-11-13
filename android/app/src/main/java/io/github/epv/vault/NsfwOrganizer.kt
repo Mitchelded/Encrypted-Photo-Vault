@@ -103,7 +103,9 @@ class NsfwOrganizer(private val context: Context) {
             }
             cancelled()
             keepCopy = true
-            return source.delete()
+            // A read-only provider may throw rather than return false.
+            // In either case preserve both copies and mark as copied-only.
+            return try { source.delete() } catch (_: SecurityException) { false }
         } finally {
             if (!keepCopy) try { dest.delete() } catch (_: Exception) {}
         }
