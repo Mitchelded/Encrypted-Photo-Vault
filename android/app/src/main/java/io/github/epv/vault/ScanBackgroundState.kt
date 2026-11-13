@@ -13,11 +13,19 @@ object ScanBackgroundState {
         private set
 
     private const val PREFS = "epv_background_scan"
+    @Volatile var serviceAlive: Boolean = false
 
     fun refresh(context: Context) {
         val preferences = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        runningMode = preferences.getString("mode", "") ?: ""
-        message = preferences.getString("message", "") ?: ""
+        val saved = preferences.getString("mode", "") ?: ""
+        if (saved.isNotEmpty() && !serviceAlive) {
+            // A system kill may skip onDestroy; do not lock Resume controls.
+            publish(context, "", "Android завершил фоновой процесс. " +
+                "Очередь сохранена — нажмите «Продолжить».")
+        } else {
+            runningMode = saved
+            message = preferences.getString("message", "") ?: ""
+        }
     }
 
     fun publish(context: Context, mode: String, text: String) {
