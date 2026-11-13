@@ -1,0 +1,36 @@
+name: EPV Vector LSPosed module APK
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  vector-bridge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+      - name: Build Vector Xposed module
+        run: gradle -p android :vector-bridge:assembleDebug --stacktrace
+      - name: Verify Xposed module metadata
+        run: |
+          python3 - <<'PY'
+          import zipfile
+          apk = "android/vector-bridge/build/outputs/apk/debug/vector-bridge-debug.apk"
+          with zipfile.ZipFile(apk) as archive:
+              entry = archive.read("assets/xposed_init").decode().strip()
+              assert entry == "io.github.epv.vectorbridge.PhotosHook", entry
+              assert "classes.dex" in archive.namelist(), "Missing Xposed module dex"
+              print("Verified classic Xposed entry point:", entry)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EPV-Vector-Bridge-debug-apk
+          path: android/vector-bridge/build/outputs/apk/debug/vector-bridge-debug.apk
