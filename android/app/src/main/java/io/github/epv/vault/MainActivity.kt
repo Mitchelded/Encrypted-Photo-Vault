@@ -254,6 +254,7 @@ class MainActivity : ComponentActivity() {
                     when (intent?.getStringExtra("epv_launch")) {
                         "cloud" -> status = "Google Фото: введите пароль и нажмите «Выбрать зашифрованные PNG из Google Фото»"
                         "nsfw" -> status = "Поиск 18+: введите пароль, затем выберите папку или продолжите сканирование"
+                        "organize" -> status = "Сортировка без шифрования: выберите исходную папку и папку для 18+, затем запустите перенос. Пароль не нужен."
                     }
                     intent?.removeExtra("epv_launch")
                 }
