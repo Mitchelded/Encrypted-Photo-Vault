@@ -13,6 +13,12 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.gestures.rememberTransformableState
+import androidx.compose.foundation.gestures.transformable
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -221,17 +227,39 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 if (imagePreview != null) {
-                    AlertDialog(
+                    Dialog(
                         onDismissRequest = { imagePreview = null },
-                        title = { Text(previewTitle) },
-                        text = {
-                            Image(bitmap = imagePreview!!.asImageBitmap(),
-                                  contentDescription = previewTitle,
-                                  modifier = Modifier.fillMaxWidth().heightIn(max = 510.dp),
-                                  contentScale = ContentScale.Fit)
-                        },
-                        confirmButton = { TextButton(onClick = { imagePreview = null }) { Text("Закрыть") } }
-                    )
+                        properties = DialogProperties(usePlatformDefaultWidth = false)
+                    ) {
+                        Surface(Modifier.fillMaxSize()) {
+                            Column(Modifier.fillMaxSize().padding(10.dp)) {
+                                Row(Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically) {
+                                    Text(previewTitle, style = MaterialTheme.typography.titleMedium,
+                                         modifier = Modifier.weight(1f), maxLines = 2,
+                                         overflow = TextOverflow.Ellipsis)
+                                    TextButton(onClick = { imagePreview = null }) { Text("Закрыть") }
+                                }
+                                var zoom by remember(imagePreview) { mutableFloatStateOf(1f) }
+                                var pan by remember(imagePreview) { mutableStateOf(Offset.Zero) }
+                                val transform = rememberTransformableState { deltaZoom, deltaPan, _ ->
+                                    zoom = (zoom * deltaZoom).coerceIn(1f, 5f)
+                                    pan = if (zoom <= 1f) Offset.Zero else pan + deltaPan
+                                }
+                                Box(Modifier.weight(1f).fillMaxWidth(),
+                                    contentAlignment = Alignment.Center) {
+                                    Image(bitmap = imagePreview!!.asImageBitmap(),
+                                        contentDescription = previewTitle,
+                                        modifier = Modifier.fillMaxSize()
+                                            .graphicsLayer(scaleX = zoom, scaleY = zoom,
+                                                translationX = pan.x, translationY = pan.y)
+                                            .transformable(transform),
+                                        contentScale = ContentScale.Fit)
+                                }
+                            }
+                        }
+                    }
                 }
                 if (videoPreview != null) {
                     val selected = videoPreview!!
