@@ -53,6 +53,13 @@ jobs:
               data = dst.read_bytes()
               assert len(data) > 10_000_000 and data[4:8] == b"TFL3", "Invalid TFLite payload"
               print(f"Bundled release NSFW model ({len(data)} bytes)")
+          # Pin the exact model that was verified in the previous successful APK.
+          import hashlib
+          expected_sha256 = "380f98f7685f9d8a386f8cc595b6dfcb972989aae3d1b8b270d3a4a5b96fab40"
+          actual = hashlib.sha256(data).hexdigest()
+          assert actual == expected_sha256, f"Model SHA256 mismatch: {actual}"
+          shutil.copyfile("MODEL_LICENSE.md", "android/app/src/main/assets/MODEL_LICENSE.md")
+          print(f"Verified bundled model SHA-256: {actual}")
           PY
       - name: Assemble Android debug APK
         run: gradle -p android :app:assembleDebug --stacktrace
