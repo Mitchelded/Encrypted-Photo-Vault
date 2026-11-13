@@ -1,0 +1,3 @@
+cryptography>=43,<48
+argon2-cffi>=23,<26
+Pillow>=11,<13
