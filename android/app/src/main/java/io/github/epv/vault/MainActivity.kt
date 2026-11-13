@@ -56,12 +56,13 @@ import kotlinx.coroutines.ensureActive
 class MainActivity : ComponentActivity() {
     @Suppress("DEPRECATION")
     private fun incomingSharedUris(shared: Intent?): List<Uri> {
-        if (shared?.action != Intent.ACTION_SEND &&
-            shared?.action != Intent.ACTION_SEND_MULTIPLE) return emptyList()
+        val incoming = shared ?: return emptyList()
+        if (incoming.action != Intent.ACTION_SEND &&
+            incoming.action != Intent.ACTION_SEND_MULTIPLE) return emptyList()
         val streams = mutableListOf<Uri>()
-        shared.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)?.let(streams::add)
-        shared.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)?.let(streams::addAll)
-        shared.clipData?.let { clip ->
+        incoming.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)?.let(streams::add)
+        incoming.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)?.let(streams::addAll)
+        incoming.clipData?.let { clip ->
             for (index in 0 until clip.itemCount)
                 clip.getItemAt(index).uri?.let(streams::add)
         }
