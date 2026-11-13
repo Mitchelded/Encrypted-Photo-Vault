@@ -82,15 +82,15 @@ class MainActivity : ComponentActivity() {
                 var busy by remember { mutableStateOf(false) }
                 var nsfwThreshold by remember { mutableFloatStateOf(scanStore.lastThreshold()) }
                 var nsfwTarget by remember { mutableStateOf(scanStore.lastFolder()) }
-                var scanJob by remember { mutableStateOf<Job?>(null) }
                 var nsfwCheckpoint by remember { mutableLongStateOf(0L) }
                 var moveSource by remember { mutableStateOf(scanStore.lastMoveSource()) }
                 var moveDestination by remember { mutableStateOf(scanStore.lastMoveTarget()) }
-                var moveJob by remember { mutableStateOf<Job?>(null) }
                 var moveCheckpoint by remember { mutableLongStateOf(0L) }
                 var movePending by remember { mutableLongStateOf(0L) }
                 var moveTotal by remember { mutableLongStateOf(0L) }
                 var confirmMove by remember { mutableStateOf(false) }
+                var pcEnabled by remember { mutableStateOf(false) }
+                var pcToken by remember { mutableStateOf("") }
                 var status by remember { mutableStateOf("Готово к работе. Данные не отправляются на сторонние серверы.") }
                 var galleryUri by remember { mutableStateOf<Uri?>(null) }
                 var cloudSelected by remember { mutableStateOf(false) }
@@ -101,166 +101,56 @@ class MainActivity : ComponentActivity() {
                 val scope = rememberCoroutineScope()
                 val thumbSemaphore = remember { Semaphore(2) }
                 fun startNsfwScan(folder: Uri) {
-                    if (busy || password.isEmpty()) {
-                        status = "Введите пароль или завершите текущую операцию"
+                    if (busy || ScanBackgroundState.runningMode.isNotEmpty() || password.isBlank()) {
+                        status = "Введите пароль или дождитесь завершения текущей проверки"
                         return
                     }
-                    val currentPassword = password
-                    val currentThreshold = nsfwThreshold
-                    val scanId = scanStore.scanId(folder, currentThreshold)
                     try {
-                        scanStore.rememberFolder(folder, currentThreshold)
+                        scanStore.rememberFolder(folder, nsfwThreshold)
                         nsfwTarget = folder
-                    } catch (t: Exception) {
-                        status = "Не удалось сохранить папку: ${t.localizedMessage}"
-                        return
-                    }
-                    scanJob = scope.launch {
-                        busy = true
-                        status = "Продолжение проверки с сохранённого места..."
-                        try {
-                            val result = withContext(Dispatchers.IO) {
-                                val jobContext = currentCoroutineContext()
-                                LocalNsfwClassifier(this@MainActivity).use { classifier ->
-                                    repo.encryptFolder(
-                                        folder, currentPassword,
-                                        { index, count, filename, part, parts ->
-                                            runOnUiThread {
-                                                if (scanJob?.isActive == true) {
-                                                    status = if (part == 0)
-                                                        "Поиск 18+: $index/$count — $filename"
-                                                    else
-                                                        "Шифрование 18+: $index/$count — PNG $part/$parts"
-                                                }
-                                            }
-                                        },
-                                        checkCancelled = { jobContext.ensureActive() },
-                                        shouldEncrypt = { uri ->
-                                            jobContext.ensureActive()
-                                            val score = classifier.scoreMedia(uri)
-                                            jobContext.ensureActive()
-                                            score != null && score >= currentThreshold
-                                        },
-                                        alreadyProcessed = { uri, length, modified ->
-                                            scanStore.alreadyScanned(scanId, uri, length, modified)
-                                        },
-                                        onProcessed = { uri, length, modified ->
-                                            scanStore.markScanned(scanId, uri, length, modified)
-                                        }
-                                    )
-                                }
-                            }
-                            nsfwCheckpoint = withContext(Dispatchers.IO) {
-                                scanStore.completedCount(scanId)
-                            }
-                            status = "Поиск завершён. Уже проверено ранее: ${result.previouslyProcessed}; " +
-                                "новых зашифровано: ${result.successful} (${result.pngCount} PNG), " +
-                                "без 18+: ${result.skipped}; ошибок: ${result.failed}. " +
-                                result.failures.joinToString("; ")
-                        } catch (_: CancellationException) {
-                            // Completed receipts were committed before cancellation.
-                            status = "Поиск 18+ остановлен. Проверенные файлы сохранены в прогрессе. " +
-                                "Нажмите «Продолжить», чтобы начать с оставшихся."
-                        } catch (t: Throwable) {
-                            status = "Ошибка поиска 18+: ${t.localizedMessage}. " +
-                                "Готовые файлы останутся отмечены для продолжения."
-                        } finally {
-                            nsfwCheckpoint = scanStore.completedCount(scanId)
-                            busy = false
-                            scanJob = null
-                        }
-                    }
+                        startForegroundService(Intent(this@MainActivity, NsfwScanService::class.java).apply {
+                            action = NsfwScanService.START
+                            putExtra("mode", NsfwScanService.ENCRYPT)
+                            putExtra(NsfwScanService.SOURCE, folder)
+                            putExtra(NsfwScanService.THRESHOLD, nsfwThreshold)
+                            putExtra(NsfwScanService.PASSWORD, password)
+                        })
+                        status = "Поиск 18+ запущен в фоне. Экран можно выключить."
+                    } catch (e: Exception) { status = "Не удалось запустить: " + e.localizedMessage }
                 }
                 fun startOrganizing() {
                     val src = moveSource
                     val dst = moveDestination
-                    if (src == null || dst == null || busy) {
-                        status = "Выберите две папки и завершите текущую операцию"
+                    if (src == null || dst == null || busy ||
+                        ScanBackgroundState.runningMode.isNotEmpty()) {
+                        status = "Выберите папки и завершите предыдущую проверку"
                         return
                     }
-                    val threshold = nsfwThreshold
-                    val scanId = scanStore.moveScanId(src, dst, threshold)
+                    if (pcEnabled && pcToken.trim().length < 12) {
+                        status = "Введите код из окна PC-сервера"
+                        return
+                    }
                     try {
                         scanStore.saveMoveFolders(src, dst)
-                    } catch (e: Exception) {
-                        status = "Не удалось сохранить папки: ${e.localizedMessage}"
-                        return
-                    }
-                    moveJob = scope.launch {
-                        busy = true
-                        status = "Открываю сохранённую очередь 18+..."
-                        try {
-                            val result = withContext(Dispatchers.IO) {
-                                val context = currentCoroutineContext()
-                                // The 17 MB model is loaded only AFTER indexing,
-                                // when the first image actually needs inference.
-                                val classifier = lazy(LazyThreadSafetyMode.NONE) {
-                                    LocalNsfwClassifier(this@MainActivity)
-                                }
-                                try {
-                                    NsfwOrganizer(this@MainActivity).moveFolder(
-                                        sourceUri = src,
-                                        destinationUri = dst,
-                                        threshold = threshold,
-                                        scanId = scanId,
-                                        queue = moveQueue,
-                                        score = { uri ->
-                                            context.ensureActive()
-                                            val prediction = classifier.value.scoreMedia(uri)
-                                            context.ensureActive()
-                                            prediction
-                                        },
-                                        alreadyChecked = { uri, length, modified ->
-                                            scanStore.alreadyScanned(scanId, uri, length, modified)
-                                        },
-                                        markChecked = { uri, length, modified ->
-                                            scanStore.markScanned(scanId, uri, length, modified)
-                                        },
-                                        cancelled = { context.ensureActive() },
-                                        onIndexing = { stage, count ->
-                                            runOnUiThread {
-                                                if (moveJob?.isActive == true) {
-                                                    status = "$stage: найдено $count файлов..."
-                                                }
-                                            }
-                                        },
-                                        onProgress = { index, total, filename ->
-                                            runOnUiThread {
-                                                if (moveJob?.isActive == true) {
-                                                    status = "Проверка/перенос 18+: $index/$total — $filename"
-                                                }
-                                            }
-                                        }
-                                    )
-                                } finally {
-                                    if (classifier.isInitialized()) classifier.value.close()
-                                }
-                            }
-                            moveCheckpoint = moveQueue.done(scanId)
-                            movePending = moveQueue.pending(scanId)
-                            moveTotal = moveQueue.total(scanId)
-                            status = "Сортировка завершена: перемещено ${result.moved}, " +
-                                "оставлено в исходной папке ${result.safe}, " +
-                                "уже проверено ${result.previouslyChecked}, " +
-                                "только скопировано (нет права удалить) ${result.copiedNotDeleted}, " +
-                                "ошибок ${result.errors}. " + result.examples.joinToString("; ")
-                        } catch (_: CancellationException) {
-                            status = "Перенос остановлен. Уже проверенные фото учтены; " +
-                                "для продолжения нажмите «Продолжить перенос»."
-                        } catch (e: Throwable) {
-                            status = "Ошибка сортировки: ${e.localizedMessage}. " +
-                                "Обработанные файлы останутся в истории."
-                        } finally {
-                            withContext(NonCancellable + Dispatchers.IO) {
-                                moveCheckpoint = moveQueue.done(scanId)
-                                movePending = moveQueue.pending(scanId)
-                                moveTotal = moveQueue.total(scanId)
-                            }
-                            moveJob = null
-                            busy = false
-                        }
-                    }
+                        startForegroundService(Intent(this@MainActivity, NsfwScanService::class.java).apply {
+                            action = NsfwScanService.START
+                            putExtra("mode", NsfwScanService.ORGANIZE)
+                            putExtra(NsfwScanService.SOURCE, src)
+                            putExtra(NsfwScanService.TARGET, dst)
+                            putExtra(NsfwScanService.THRESHOLD, nsfwThreshold)
+                            putExtra(NsfwScanService.REMOTE, pcEnabled)
+                            if (pcEnabled) putExtra(NsfwScanService.TOKEN, pcToken.trim())
+                        })
+                        status = if (pcEnabled) "Сканирование на ПК по USB запущено в фоне."
+                            else "Локальная сортировка запущена в фоне."
+                    } catch (e: Exception) { status = "Ошибка запуска: " + e.localizedMessage }
                 }
+                fun stopBackground() {
+                    startService(Intent(this@MainActivity, NsfwScanService::class.java)
+                        .setAction(NsfwScanService.STOP))
+                    status = "Останавливаю. Очередь останется сохранённой."
+                }
+                LaunchedEffect(Unit) { ScanBackgroundState.refresh(this@MainActivity) }
                 LaunchedEffect(moveSource, moveDestination, nsfwThreshold) {
                     val src = moveSource
                     val dst = moveDestination
@@ -686,11 +576,11 @@ class MainActivity : ComponentActivity() {
                                 modifier = Modifier.fillMaxWidth()
                             ) { Text("▶ Продолжить с последнего файла") }
                         }
-                        if (scanJob != null) {
+                        if (ScanBackgroundState.runningMode == NsfwScanService.ENCRYPT) {
                             Button(
                                 onClick = {
                                     status = "Остановка поиска 18+..."
-                                    scanJob?.cancel()
+                                    stopBackground()
                                 },
                                 modifier = Modifier.fillMaxWidth(),
                                 colors = ButtonDefaults.buttonColors(
@@ -724,6 +614,50 @@ class MainActivity : ComponentActivity() {
                              "оригинальные файлы как есть. Подпапки сохраняются. Пароль не нужен. " +
                              "Сначала создаётся и проверяется SHA-256 копия, только затем удаляется исходник.",
                              style = MaterialTheme.typography.bodyMedium)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(checked = pcEnabled,
+                                onCheckedChange = { pcEnabled = it },
+                                enabled = !busy && ScanBackgroundState.runningMode.isEmpty())
+                            Text("Распознавать 18+ на ПК по USB / ADB")
+                        }
+                        if (pcEnabled) {
+                            Text("На компьютер идут только JPEG-превью 224×224, а не оригиналы. " +
+                                 "На ПК запустите pc_nsfw/start_windows.ps1 (4 потока).",
+                                 style = MaterialTheme.typography.bodySmall)
+                            OutlinedTextField(
+                                value = pcToken,
+                                onValueChange = { pcToken = it },
+                                label = { Text("Код PC-сервера (не сохраняется)") },
+                                visualTransformation = PasswordVisualTransformation(),
+                                singleLine = true,
+                                enabled = !busy && ScanBackgroundState.runningMode.isEmpty(),
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            Button(
+                                onClick = {
+                                    scope.launch {
+                                        busy = true
+                                        try {
+                                            withContext(Dispatchers.IO) {
+                                                PcNsfwClient(this@MainActivity, pcToken.trim()).use {
+                                                    it.checkConnection()
+                                                }
+                                            }
+                                            status = "ПК подключён. Можно начинать сортировку."
+                                        } catch (e: Exception) {
+                                            status = "Ошибка подключения ПК: " + e.localizedMessage
+                                        } finally { busy = false }
+                                    }
+                                },
+                                enabled = !busy && pcToken.trim().length >= 12 &&
+                                    ScanBackgroundState.runningMode.isEmpty(),
+                                modifier = Modifier.fillMaxWidth()
+                            ) { Text("Проверить подключение к ПК") }
+                        }
+                        if (ScanBackgroundState.runningMode.isNotEmpty()) {
+                            Text("Фоновый поиск: " + ScanBackgroundState.message,
+                                style = MaterialTheme.typography.bodyMedium)
+                        }
                         Text("Исходная: " +
                             (moveSource?.lastPathSegment?.substringAfterLast(':') ?: "не выбрана"),
                             style = MaterialTheme.typography.bodySmall)
@@ -762,9 +696,9 @@ class MainActivity : ComponentActivity() {
                                 }
                             ) { Text("Сбросить историю сортировки") }
                         }
-                        if (moveJob != null) {
+                        if (ScanBackgroundState.runningMode == NsfwScanService.ORGANIZE) {
                             Button(
-                                onClick = { moveJob?.cancel(); status = "Останавливаю перенос после текущего шага..." },
+                                onClick = { stopBackground() },
                                 modifier = Modifier.fillMaxWidth(),
                                 colors = ButtonDefaults.buttonColors(
                                     containerColor = MaterialTheme.colorScheme.error)
