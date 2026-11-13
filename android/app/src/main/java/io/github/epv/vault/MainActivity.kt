@@ -1,5 +1,6 @@
 package io.github.epv.vault
 
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.MediaPlayer
@@ -38,6 +39,8 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -56,9 +59,13 @@ class MainActivity : ComponentActivity() {
         val repo = VaultRepository(this)
         setContent {
             MaterialTheme {
+                val scanStore = remember { NsfwProgressStore(this@MainActivity) }
                 var password by remember { mutableStateOf("") }
                 var busy by remember { mutableStateOf(false) }
-                var nsfwThreshold by remember { mutableFloatStateOf(0.70f) }
+                var nsfwThreshold by remember { mutableFloatStateOf(scanStore.lastThreshold()) }
+                var nsfwTarget by remember { mutableStateOf(scanStore.lastFolder()) }
+                var scanJob by remember { mutableStateOf<Job?>(null) }
+                var nsfwCheckpoint by remember { mutableLongStateOf(0L) }
                 var status by remember { mutableStateOf("Готово к работе. Данные не отправляются на сторонние серверы.") }
                 var galleryUri by remember { mutableStateOf<Uri?>(null) }
                 var cloudSelected by remember { mutableStateOf(false) }
@@ -68,6 +75,83 @@ class MainActivity : ComponentActivity() {
                 var previewTitle by remember { mutableStateOf("") }
                 val scope = rememberCoroutineScope()
                 val thumbSemaphore = remember { Semaphore(2) }
+                fun startNsfwScan(folder: Uri) {
+                    if (busy || password.isEmpty()) {
+                        status = "Введите пароль или завершите текущую операцию"
+                        return
+                    }
+                    val currentPassword = password
+                    val currentThreshold = nsfwThreshold
+                    val scanId = scanStore.scanId(folder, currentThreshold)
+                    try {
+                        scanStore.rememberFolder(folder, currentThreshold)
+                        nsfwTarget = folder
+                    } catch (t: Exception) {
+                        status = "Не удалось сохранить папку: ${t.localizedMessage}"
+                        return
+                    }
+                    scanJob = scope.launch {
+                        busy = true
+                        status = "Продолжение проверки с сохранённого места..."
+                        try {
+                            val result = withContext(Dispatchers.IO) {
+                                val jobContext = currentCoroutineContext()
+                                LocalNsfwClassifier(this@MainActivity).use { classifier ->
+                                    repo.encryptFolder(
+                                        folder, currentPassword,
+                                        { index, count, filename, part, parts ->
+                                            runOnUiThread {
+                                                if (scanJob?.isActive == true) {
+                                                    status = if (part == 0)
+                                                        "Поиск 18+: $index/$count — $filename"
+                                                    else
+                                                        "Шифрование 18+: $index/$count — PNG $part/$parts"
+                                                }
+                                            }
+                                        },
+                                        checkCancelled = { jobContext.ensureActive() },
+                                        shouldEncrypt = { uri ->
+                                            jobContext.ensureActive()
+                                            val score = classifier.scoreMedia(uri)
+                                            jobContext.ensureActive()
+                                            score != null && score >= currentThreshold
+                                        },
+                                        alreadyProcessed = { uri, length, modified ->
+                                            scanStore.alreadyScanned(scanId, uri, length, modified)
+                                        },
+                                        onProcessed = { uri, length, modified ->
+                                            scanStore.markScanned(scanId, uri, length, modified)
+                                        }
+                                    )
+                                }
+                            }
+                            nsfwCheckpoint = withContext(Dispatchers.IO) {
+                                scanStore.completedCount(scanId)
+                            }
+                            status = "Поиск завершён. Уже проверено ранее: ${result.previouslyProcessed}; " +
+                                "новых зашифровано: ${result.successful} (${result.pngCount} PNG), " +
+                                "без 18+: ${result.skipped}; ошибок: ${result.failed}. " +
+                                result.failures.joinToString("; ")
+                        } catch (_: CancellationException) {
+                            // Completed receipts were committed before cancellation.
+                            status = "Поиск 18+ остановлен. Проверенные файлы сохранены в прогрессе. " +
+                                "Нажмите «Продолжить», чтобы начать с оставшихся."
+                        } catch (t: Throwable) {
+                            status = "Ошибка поиска 18+: ${t.localizedMessage}. " +
+                                "Готовые файлы останутся отмечены для продолжения."
+                        } finally {
+                            nsfwCheckpoint = scanStore.completedCount(scanId)
+                            busy = false
+                            scanJob = null
+                        }
+                    }
+                }
+                LaunchedEffect(nsfwTarget, nsfwThreshold) {
+                    val target = nsfwTarget
+                    nsfwCheckpoint = if (target == null) 0L else withContext(Dispatchers.IO) {
+                        scanStore.completedCount(scanStore.scanId(target, nsfwThreshold))
+                    }
+                }
                 val encryptPicker = rememberLauncherForActivityResult(
                     ActivityResultContracts.OpenMultipleDocuments()
                 ) { files ->
@@ -200,34 +284,17 @@ class MainActivity : ComponentActivity() {
                     ActivityResultContracts.OpenDocumentTree()
                 ) { folder ->
                     if (folder == null) return@rememberLauncherForActivityResult
-                    if (password.isEmpty()) { status = "Введите пароль"; return@rememberLauncherForActivityResult }
-                    val currentPassword = password
-                    val currentThreshold = nsfwThreshold
-                    scope.launch {
-                        busy = true
-                        status = "Запуск локальной проверки изображений и видео..."
-                        try {
-                            val result = withContext(Dispatchers.IO) {
-                                LocalNsfwClassifier(this@MainActivity).use { classifier ->
-                                    repo.encryptFolder(folder, currentPassword,
-                                        { index, count, filename, part, parts ->
-                                            runOnUiThread {
-                                                status = if (part == 0) "Проверка 18+: $index/$count — $filename"
-                                                else "Шифрование 18+: $index/$count — PNG $part/$parts"
-                                            }
-                                        },
-                                        shouldEncrypt = { uri ->
-                                            (classifier.scoreMedia(uri) ?: 0f) >= currentThreshold
-                                        })
-                                }
-                            }
-                            status = "Проверено ${result.total} файлов: зашифровано ${result.successful}, " +
-                                "пропущено ${result.skipped}, ошибок ${result.failed}. " +
-                                "PNG: ${result.pngCount}. " + result.failures.joinToString("; ")
-                        } catch (t: Throwable) {
-                            status = "Локальная проверка 18+ не выполнена: ${t.localizedMessage}"
-                        } finally { busy = false }
+                    if (busy || password.isEmpty()) {
+                        status = "Введите пароль или завершите текущую операцию"
+                        return@rememberLauncherForActivityResult
                     }
+                    try {
+                        contentResolver.takePersistableUriPermission(
+                            folder, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    } catch (e: SecurityException) {
+                        status = "Нет постоянного доступа к папке: после перезапуска потребуется выбрать её снова"
+                    }
+                    startNsfwScan(folder)
                 }
                 if (imagePreview != null) {
                     Dialog(
@@ -326,11 +393,52 @@ class MainActivity : ComponentActivity() {
                         Text("Порог: ${(nsfwThreshold * 100).toInt()}%")
                         Slider(value = nsfwThreshold, onValueChange = { nsfwThreshold = it },
                             valueRange = 0.5f..0.98f, enabled = !busy)
+                        if (nsfwTarget != null) {
+                            Text("Папка: ${nsfwTarget?.lastPathSegment?.substringAfterLast(':') ?: "выбрана"}",
+                                style = MaterialTheme.typography.bodySmall)
+                            Text("В базе уже проверено: $nsfwCheckpoint файлов для этого порога",
+                                style = MaterialTheme.typography.bodySmall)
+                        }
                         Button(
                             onClick = { nsfwFolderPicker.launch(null) },
                             enabled = !busy && password.isNotEmpty(),
                             modifier = Modifier.fillMaxWidth()
-                        ) { Text("Найти 18+ в папке и зашифровать") }
+                        ) { Text("Выбрать папку и запустить поиск 18+") }
+                        if (nsfwTarget != null) {
+                            Button(
+                                onClick = { nsfwTarget?.let(::startNsfwScan) },
+                                enabled = !busy && password.isNotEmpty(),
+                                modifier = Modifier.fillMaxWidth()
+                            ) { Text("▶ Продолжить с последнего файла") }
+                        }
+                        if (scanJob != null) {
+                            Button(
+                                onClick = {
+                                    status = "Остановка поиска 18+..."
+                                    scanJob?.cancel()
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = MaterialTheme.colorScheme.error)
+                            ) { Text("■ Остановить поиск 18+") }
+                        }
+                        if (nsfwTarget != null) {
+                            TextButton(
+                                onClick = {
+                                    val folder = nsfwTarget ?: return@TextButton
+                                    scanStore.clear(scanStore.scanId(folder, nsfwThreshold))
+                                    nsfwCheckpoint = 0L
+                                    status = "Прогресс сброшен для выбранного порога. " +
+                                        "При следующем запуске файлы проверятся заново."
+                                },
+                                enabled = !busy,
+                                modifier = Modifier.fillMaxWidth()
+                            ) { Text("Сбросить прогресс для этой папки и порога") }
+                        }
+                        Text("Прогресс записывается после каждого полностью обработанного файла. " +
+                             "При остановке или перезапуске повторный анализ обработанных файлов не нужен. " +
+                             "Для продолжения используйте тот же пароль и порог.",
+                             style = MaterialTheme.typography.bodySmall)
                         Text("Результаты классификации могут быть ошибочны. Рекомендуется проверить их вручную; " +
                              "данные не удаляются и не передаются в интернет.",
                              style = MaterialTheme.typography.bodySmall)
