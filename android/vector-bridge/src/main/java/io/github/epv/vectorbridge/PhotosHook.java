@@ -86,6 +86,11 @@ public final class PhotosHook implements IXposedHookLoadPackage, IXposedHookZygo
         TextView scan = button(activity, "18+");
         scan.setContentDescription("Открыть локальный поиск 18+ в Encrypted Photo Vault");
         scan.setOnClickListener(v -> openVault(activity, "nsfw"));
+        scan.setOnLongClickListener(v -> {
+            openVault(activity, "organize");
+            return true;
+        });
+        scan.setContentDescription("Поиск 18+: нажать для шифрования, удержать для сортировки в папку без шифрования");
         LinearLayout.LayoutParams second = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         second.leftMargin = dp(activity, 6);
