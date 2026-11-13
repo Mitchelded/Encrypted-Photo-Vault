@@ -1,0 +1,123 @@
+package io.github.epv.vectorbridge;
+
+import android.app.Activity;
+import android.content.ActivityNotFoundException;
+import android.content.Intent;
+import android.graphics.Color;
+import android.graphics.drawable.GradientDrawable;
+import android.view.Gravity;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import de.robv.android.xposed.IXposedHookLoadPackage;
+import de.robv.android.xposed.XC_MethodHook;
+import de.robv.android.xposed.XposedHelpers;
+import de.robv.android.xposed.callbacks.XC_LoadPackage;
+
+/**
+ * Minimal Google Photos -> Encrypted Photo Vault integration for Vector/LSPosed.
+ *
+ * Hooks only the public Android Activity lifecycle, not obfuscated
+ * Google Photos internals, Photos account tokens, or the backup protocol.
+ * No READ_MEDIA permissions and no automatic access to cloud photos.
+ */
+public final class PhotosHook implements IXposedHookLoadPackage {
+    private static final String GOOGLE_PHOTOS = "com.google.android.apps.photos";
+    private static final String EPV_PACKAGE = "io.github.epv.vault";
+    private static final String EPV_ACTIVITY = EPV_PACKAGE + ".MainActivity";
+    private static final String PANEL_TAG = "epv_vector_bridge_panel_v1";
+
+    @Override
+    public void handleLoadPackage(XC_LoadPackage.LoadPackageParam param) {
+        if (!GOOGLE_PHOTOS.equals(param.packageName)) return;
+        if (!GOOGLE_PHOTOS.equals(param.processName)) return;
+
+        try {
+            XposedHelpers.findAndHookMethod(Activity.class, "onResume", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam hookParam) {
+                    if (!(hookParam.thisObject instanceof Activity)) return;
+                    try {
+                        attachPanel((Activity) hookParam.thisObject);
+                    } catch (Throwable ignored) {
+                        // Never crash the host photo gallery because of our overlay.
+                    }
+                }
+            });
+        } catch (Throwable ignored) {
+            // Avoid a crash if an unsupported Vector build rejects the hook.
+        }
+    }
+
+    private static void attachPanel(Activity activity) {
+        if (activity.isFinishing() || activity.isDestroyed()) return;
+        View decor = activity.getWindow().getDecorView();
+        if (!(decor instanceof FrameLayout)) return;
+        FrameLayout frame = (FrameLayout) decor;
+        if (frame.findViewWithTag(PANEL_TAG) != null) return;
+
+        LinearLayout panel = new LinearLayout(activity);
+        panel.setTag(PANEL_TAG);
+        panel.setOrientation(LinearLayout.HORIZONTAL);
+        panel.setGravity(Gravity.CENTER_VERTICAL);
+        panel.setElevation(dp(activity, 8));
+
+        TextView gallery = button(activity, "EPV");
+        gallery.setContentDescription("Открыть Encrypted Photo Vault");
+        gallery.setOnClickListener(v -> openVault(activity, "cloud"));
+        panel.addView(gallery);
+
+        TextView scan = button(activity, "18+");
+        scan.setContentDescription("Открыть локальный поиск 18+ в Encrypted Photo Vault");
+        scan.setOnClickListener(v -> openVault(activity, "nsfw"));
+        LinearLayout.LayoutParams second = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        second.leftMargin = dp(activity, 6);
+        panel.addView(scan, second);
+
+        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM | Gravity.END);
+        params.bottomMargin = dp(activity, 98);
+        params.rightMargin = dp(activity, 14);
+        frame.addView(panel, params);
+    }
+
+    private static TextView button(Activity activity, String text) {
+        TextView view = new TextView(activity);
+        view.setText(text);
+        view.setTextColor(Color.WHITE);
+        view.setTextSize(13f);
+        view.setGravity(Gravity.CENTER);
+        view.setPadding(dp(activity, 16), dp(activity, 9),
+                dp(activity, 16), dp(activity, 9));
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(0xEB263650);
+        background.setCornerRadius(dp(activity, 18));
+        view.setBackground(background);
+        view.setClickable(true);
+        return view;
+    }
+
+    private static void openVault(Activity activity, String mode) {
+        Intent open = new Intent(Intent.ACTION_VIEW);
+        open.setClassName(EPV_PACKAGE, EPV_ACTIVITY);
+        open.putExtra("epv_launch", mode);
+        try {
+            activity.startActivity(open);
+        } catch (ActivityNotFoundException | SecurityException exception) {
+            Toast.makeText(activity,
+                    "Сначала установите Encrypted Photo Vault",
+                    Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private static int dp(Activity activity, int value) {
+        return Math.round(value * activity.getResources().getDisplayMetrics().density);
+    }
+}
