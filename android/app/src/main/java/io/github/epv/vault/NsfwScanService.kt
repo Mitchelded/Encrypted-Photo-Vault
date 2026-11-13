@@ -39,6 +39,7 @@ class NsfwScanService : Service() {
         super.onCreate()
         getSystemService(NotificationManager::class.java).createNotificationChannel(
             NotificationChannel(CHANNEL, "Поиск 18+ в фоне", NotificationManager.IMPORTANCE_LOW))
+        ScanBackgroundState.serviceAlive = true
         ScanBackgroundState.refresh(this)
     }
 
@@ -230,6 +231,7 @@ class NsfwScanService : Service() {
         job?.cancel()
         scope.cancel()
         releaseLock()
+        ScanBackgroundState.serviceAlive = false
         ScanBackgroundState.publish(this, "", message)
         super.onDestroy()
     }
