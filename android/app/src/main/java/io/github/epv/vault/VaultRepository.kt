@@ -205,6 +205,8 @@ class VaultRepository(private val context: Context) {
     // The provider may fetch cloud data behind the scenes; EPV does not export
     // a decrypted copy and only retains URIs for the current app session.
     private var pickedGroups: Map<String, List<EncodedPart>> = emptyMap()
+    private var lastFolderUri: Uri? = null
+    private var lastFolderGroups: Map<String, List<EncodedPart>> = emptyMap()
 
     fun galleryPicked(selected: List<Uri>, password: String): List<Item> {
         val grouped = linkedMapOf<String, MutableList<EncodedPart>>()
@@ -253,7 +255,10 @@ class VaultRepository(private val context: Context) {
     /** Unlock names and media types for a private gallery, without restoring to Downloads. */
     fun gallery(rootUri: Uri, password: String): List<Item> {
         val root = DocumentFile.fromTreeUri(context, rootUri) ?: error("Cannot access folder")
-        return collect(root).map { (id, parts) ->
+        val groups = collect(root)
+        lastFolderUri = rootUri
+        lastFolderGroups = groups
+        return groups.map { (id, parts) ->
             val count = parts.first().header.partCount
             if (parts.size != count) Item(id, parts.size, count, "Неполный набор")
             else try {
@@ -269,7 +274,8 @@ class VaultRepository(private val context: Context) {
     /** A password-gated random-access source for in-memory photo and streamed video preview. */
     fun openMedia(rootUri: Uri, id: String, password: String): EpvMediaDataSource {
         val root = DocumentFile.fromTreeUri(context, rootUri) ?: error("Cannot access folder")
-        val group = collect(root)[id] ?: error("File no longer in vault folder")
+        val groups = if (rootUri == lastFolderUri) lastFolderGroups else collect(root)
+        val group = groups[id] ?: error("File no longer in vault folder")
         return EpvMediaDataSource(context,
             group.sortedBy { it.header.partIndex }.map { it.uri to it.header }, password)
     }
