@@ -414,6 +414,59 @@ class MainActivity : ComponentActivity() {
                                     }
                                 }
                             ) { Text("Зашифровать полученные через «Поделиться»") }
+                            Button(
+                                enabled = !busy && password.isNotEmpty(),
+                                modifier = Modifier.fillMaxWidth(),
+                                onClick = {
+                                    val currentPassword = password
+                                    val selected = sharedUris
+                                    val threshold = nsfwThreshold
+                                    scope.launch {
+                                        busy = true
+                                        status = "Локальный анализ полученных фото и видео..."
+                                        try {
+                                            var encrypted = 0
+                                            var skipped = 0
+                                            var failed = 0
+                                            val pngCount = withContext(Dispatchers.IO) {
+                                                LocalNsfwClassifier(this@MainActivity).use { classifier ->
+                                                    var parts = 0
+                                                    for ((index, source) in selected.withIndex()) {
+                                                        try {
+                                                            runOnUiThread {
+                                                                status = "Поиск 18+ из Google Фото: ${index + 1}/${selected.size}"
+                                                            }
+                                                            val score = classifier.scoreMedia(source)
+                                                            if (score == null || score < threshold) {
+                                                                skipped++
+                                                                continue
+                                                            }
+                                                            parts += repo.encryptOne(source, currentPassword, { part, count ->
+                                                                runOnUiThread {
+                                                                    status = "Шифрование 18+: ${index + 1}/${selected.size}, PNG $part/$count"
+                                                                }
+                                                            })
+                                                            encrypted++
+                                                        } catch (e: Exception) {
+                                                            failed++
+                                                            runOnUiThread {
+                                                                status = "Ошибка обработки ${index + 1}: ${e.localizedMessage}"
+                                                            }
+                                                        }
+                                                    }
+                                                    parts
+                                                }
+                                            }
+                                            status = "Анализ из Google Фото завершён: " +
+                                                "зашифровано $encrypted ($pngCount PNG), " +
+                                                "без 18+ или нераспознано $skipped, ошибок $failed. " +
+                                                "Исходники не удалены."
+                                        } catch (t: Throwable) {
+                                            status = "Ошибка локального анализа из Google Фото: ${t.localizedMessage}"
+                                        } finally { busy = false }
+                                    }
+                                }
+                            ) { Text("Проверить 18+ и зашифровать совпадения") }
                         }
                         Text("Выберите фото, видео или другие файлы. PNG сохранятся в Pictures/EncryptedPhotoVault. " +
                              "Эту папку можно перенести на Pixel XL для загрузки в Google Фото.")
