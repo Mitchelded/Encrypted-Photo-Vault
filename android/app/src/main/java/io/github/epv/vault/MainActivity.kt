@@ -82,6 +82,11 @@ class MainActivity : ComponentActivity() {
                 var nsfwTarget by remember { mutableStateOf(scanStore.lastFolder()) }
                 var scanJob by remember { mutableStateOf<Job?>(null) }
                 var nsfwCheckpoint by remember { mutableLongStateOf(0L) }
+                var moveSource by remember { mutableStateOf(scanStore.lastMoveSource()) }
+                var moveDestination by remember { mutableStateOf(scanStore.lastMoveTarget()) }
+                var moveJob by remember { mutableStateOf<Job?>(null) }
+                var moveCheckpoint by remember { mutableLongStateOf(0L) }
+                var confirmMove by remember { mutableStateOf(false) }
                 var status by remember { mutableStateOf("Готово к работе. Данные не отправляются на сторонние серверы.") }
                 var galleryUri by remember { mutableStateOf<Uri?>(null) }
                 var cloudSelected by remember { mutableStateOf(false) }
@@ -160,6 +165,83 @@ class MainActivity : ComponentActivity() {
                             busy = false
                             scanJob = null
                         }
+                    }
+                }
+                fun startOrganizing() {
+                    val src = moveSource
+                    val dst = moveDestination
+                    if (src == null || dst == null || busy) {
+                        status = "Выберите две папки и завершите текущую операцию"
+                        return
+                    }
+                    val threshold = nsfwThreshold
+                    val scanId = scanStore.moveScanId(src, dst, threshold)
+                    try {
+                        scanStore.saveMoveFolders(src, dst)
+                    } catch (e: Exception) {
+                        status = "Не удалось сохранить папки: ${e.localizedMessage}"
+                        return
+                    }
+                    moveJob = scope.launch {
+                        busy = true
+                        status = "Ищу 18+ в исходной папке..."
+                        try {
+                            val result = withContext(Dispatchers.IO) {
+                                val context = currentCoroutineContext()
+                                LocalNsfwClassifier(this@MainActivity).use { classifier ->
+                                    NsfwOrganizer(this@MainActivity).moveFolder(
+                                        sourceUri = src,
+                                        destinationUri = dst,
+                                        threshold = threshold,
+                                        score = { uri ->
+                                            context.ensureActive()
+                                            val score = classifier.scoreMedia(uri)
+                                            context.ensureActive()
+                                            score
+                                        },
+                                        alreadyChecked = { uri, length, modified ->
+                                            scanStore.alreadyScanned(scanId, uri, length, modified)
+                                        },
+                                        markChecked = { uri, length, modified ->
+                                            scanStore.markScanned(scanId, uri, length, modified)
+                                        },
+                                        cancelled = { context.ensureActive() },
+                                        onProgress = { index, total, filename ->
+                                            runOnUiThread {
+                                                if (moveJob?.isActive == true) {
+                                                    status = "Перенос 18+: $index/$total — $filename"
+                                                }
+                                            }
+                                        }
+                                    )
+                                }
+                            }
+                            moveCheckpoint = withContext(Dispatchers.IO) {
+                                scanStore.completedCount(scanId)
+                            }
+                            status = "Сортировка завершена: перемещено ${result.moved}, " +
+                                "оставлено в исходной папке ${result.safe}, " +
+                                "уже проверено ${result.previouslyChecked}, " +
+                                "только скопировано (нет права удалить) ${result.copiedNotDeleted}, " +
+                                "ошибок ${result.errors}. " + result.examples.joinToString("; ")
+                        } catch (_: CancellationException) {
+                            status = "Перенос остановлен. Уже проверенные фото учтены; " +
+                                "для продолжения нажмите «Продолжить перенос»."
+                        } catch (e: Throwable) {
+                            status = "Ошибка сортировки: ${e.localizedMessage}. " +
+                                "Обработанные файлы останутся в истории."
+                        } finally {
+                            moveCheckpoint = scanStore.completedCount(scanId)
+                            moveJob = null
+                            busy = false
+                        }
+                    }
+                }
+                LaunchedEffect(moveSource, moveDestination, nsfwThreshold) {
+                    val src = moveSource
+                    val dst = moveDestination
+                    moveCheckpoint = if (src == null || dst == null) 0 else withContext(Dispatchers.IO) {
+                        scanStore.completedCount(scanStore.moveScanId(src, dst, nsfwThreshold))
                     }
                 }
                 LaunchedEffect(nsfwTarget, nsfwThreshold) {
@@ -303,6 +385,36 @@ class MainActivity : ComponentActivity() {
                         } finally { busy = false }
                     }
                 }
+                val moveSourcePicker = rememberLauncherForActivityResult(
+                    ActivityResultContracts.OpenDocumentTree()
+                ) { folder ->
+                    if (folder != null && !busy) {
+                        try {
+                            contentResolver.takePersistableUriPermission(folder,
+                                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                            moveSource = folder
+                            status = "Исходная папка выбрана. Выберите папку назначения."
+                        } catch (e: SecurityException) {
+                            status = "Для перемещения нужен доступ к чтению и удалению исходных файлов: " +
+                                e.localizedMessage
+                        }
+                    }
+                }
+                val moveTargetPicker = rememberLauncherForActivityResult(
+                    ActivityResultContracts.OpenDocumentTree()
+                ) { folder ->
+                    if (folder != null && !busy) {
+                        try {
+                            contentResolver.takePersistableUriPermission(folder,
+                                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                            moveDestination = folder
+                            status = "Папка назначения выбрана. Можно начать поиск 18+ без шифрования."
+                        } catch (e: SecurityException) {
+                            status = "Для проверки копирования нужен доступ к папке назначения: " +
+                                e.localizedMessage
+                        }
+                    }
+                }
                 val nsfwFolderPicker = rememberLauncherForActivityResult(
                     ActivityResultContracts.OpenDocumentTree()
                 ) { folder ->
@@ -318,6 +430,27 @@ class MainActivity : ComponentActivity() {
                         status = "Нет постоянного доступа к папке: после перезапуска потребуется выбрать её снова"
                     }
                     startNsfwScan(folder)
+                }
+                if (confirmMove) {
+                    AlertDialog(
+                        onDismissRequest = { confirmMove = false },
+                        title = { Text("Переместить 18+ файлы?") },
+                        text = {
+                            Text("Оригиналы из исходной папки будут удаляться ТОЛЬКО после " +
+                                 "копирования в выбранную папку и проверки SHA-256. " +
+                                 "Это не шифрование. Модель может ошибиться. " +
+                                 "Для максимальной безопасности сначала сделайте резервную копию.")
+                        },
+                        confirmButton = {
+                            TextButton(onClick = {
+                                confirmMove = false
+                                startOrganizing()
+                            }) { Text("Переместить найденное") }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { confirmMove = false }) { Text("Отмена") }
+                        }
+                    )
                 }
                 if (imagePreview != null) {
                     Dialog(
@@ -549,6 +682,57 @@ class MainActivity : ComponentActivity() {
                              style = MaterialTheme.typography.bodySmall)
                         Text("Результаты классификации могут быть ошибочны. Рекомендуется проверить их вручную; " +
                              "данные не удаляются и не передаются в интернет.",
+                             style = MaterialTheme.typography.bodySmall)
+                        HorizontalDivider()
+                        Text("18+ → отдельная папка (без шифрования)",
+                            style = MaterialTheme.typography.titleLarge)
+                        Text("Выбирает локальные фотографии и видео по оценке 18+, переносит " +
+                             "оригинальные файлы как есть. Подпапки сохраняются. Пароль не нужен. " +
+                             "Сначала создаётся и проверяется SHA-256 копия, только затем удаляется исходник.",
+                             style = MaterialTheme.typography.bodyMedium)
+                        Text("Исходная: " +
+                            (moveSource?.lastPathSegment?.substringAfterLast(':') ?: "не выбрана"),
+                            style = MaterialTheme.typography.bodySmall)
+                        Button(onClick = { moveSourcePicker.launch(null) },
+                            enabled = !busy,
+                            modifier = Modifier.fillMaxWidth()) { Text("Выбрать исходную папку") }
+                        Text("Для 18+: " +
+                            (moveDestination?.lastPathSegment?.substringAfterLast(':') ?: "не выбрана"),
+                            style = MaterialTheme.typography.bodySmall)
+                        Button(onClick = { moveTargetPicker.launch(null) },
+                            enabled = !busy,
+                            modifier = Modifier.fillMaxWidth()) { Text("Выбрать папку для 18+") }
+                        if (moveSource != null && moveDestination != null) {
+                            Text("Порог: ${(nsfwThreshold * 100).toInt()}%. " +
+                                 "Ранее проверено для этого режима: $moveCheckpoint",
+                                 style = MaterialTheme.typography.bodySmall)
+                            Button(
+                                onClick = { confirmMove = true },
+                                enabled = !busy,
+                                modifier = Modifier.fillMaxWidth()
+                            ) { Text("Найти 18+ и переместить / продолжить") }
+                            TextButton(
+                                enabled = !busy,
+                                modifier = Modifier.fillMaxWidth(),
+                                onClick = {
+                                    val src = moveSource ?: return@TextButton
+                                    val dst = moveDestination ?: return@TextButton
+                                    scanStore.clear(scanStore.moveScanId(src, dst, nsfwThreshold))
+                                    moveCheckpoint = 0L
+                                    status = "История сортировки сброшена: при запуске проверю все файлы."
+                                }
+                            ) { Text("Сбросить историю сортировки") }
+                        }
+                        if (moveJob != null) {
+                            Button(
+                                onClick = { moveJob?.cancel(); status = "Останавливаю перенос после текущего шага..." },
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = MaterialTheme.colorScheme.error)
+                            ) { Text("■ Остановить перенос") }
+                        }
+                        Text("Если Android запретит удаление, проверенная копия останется в новой папке, " +
+                             "а оригинал — в исходной. Google Фото в облаке этот режим не перемещает.",
                              style = MaterialTheme.typography.bodySmall)
                         HorizontalDivider()
                         Text("Приватная галерея", style = MaterialTheme.typography.titleLarge)
