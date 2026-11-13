@@ -19,14 +19,37 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p android/app/src/main/assets
-          curl -fL --retry 3 --connect-timeout 15 --max-time 180 \
-            "https://media.githubusercontent.com/media/getknit/knit/d3b8210629316247198371cc8deba46af13ce4af/app/src/main/assets/moderation/nsfw.tflite" \
-            -o android/app/src/main/assets/nsfw.tflite
           python3 - <<'PY'
-          from pathlib import Path
-          data = Path("android/app/src/main/assets/nsfw.tflite").read_bytes()
-          assert len(data) > 16_000_000 and data[4:8] == b"TFL3", "Model must be a TFLite FlatBuffer, not a Git LFS pointer"
-          print(f"Bundled offline NSFW model: {len(data)} bytes")
+          import pathlib, subprocess, urllib.request, zipfile, shutil, os
+          dst = pathlib.Path("android/app/src/main/assets/nsfw.tflite")
+          srcs = [
+              "https://media.githubusercontent.com/media/getknit/knit/main/app/src/main/assets/moderation/nsfw.tflite",
+              "https://github.com/getknit/knit/raw/refs/heads/main/app/src/main/assets/moderation/nsfw.tflite",
+          ]
+          for url in srcs:
+              try:
+                  subprocess.run(["curl", "-fLsS", "--retry", "2", "--max-time", "120",
+                                  "-o", str(dst), url], check=True)
+                  data = dst.read_bytes()
+                  if len(data) > 16_000_000 and data[4:8] == b"TFL3":
+                      print(f"Bundled offline NSFW model ({len(data)} bytes)")
+                      break
+              except Exception as e:
+                  print(f"Mirror unavailable: {type(e).__name__}")
+          else:
+              # Official model release is the fallback if a Git LFS mirror is unavailable.
+              archive = pathlib.Path("/tmp/nsfw_mobilenet_v2_140_224.zip")
+              subprocess.run(["curl", "-fLsS", "--retry", "3", "--max-time", "240",
+                  "-o", str(archive),
+                  "https://github.com/GantMan/nsfw_model/releases/download/1.1.0/nsfw_mobilenet_v2_140_224.zip"], check=True)
+              with zipfile.ZipFile(archive) as z:
+                  models = [n for n in z.namelist() if n.lower().endswith(".tflite")]
+                  assert models, "Official release does not contain a TFLite model"
+                  with z.open(models[0]) as inp, dst.open("wb") as out:
+                      shutil.copyfileobj(inp, out)
+              data = dst.read_bytes()
+              assert len(data) > 10_000_000 and data[4:8] == b"TFL3", "Invalid TFLite payload"
+              print(f"Bundled release NSFW model ({len(data)} bytes)")
           PY
       - name: Assemble Android debug APK
         run: gradle -p android :app:assembleDebug --stacktrace
