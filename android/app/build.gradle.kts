@@ -18,8 +18,8 @@ android {
         applicationId = "io.github.epv.vault"
         minSdk = 29
         targetSdk = 35
-        versionCode = 9
-        versionName = "0.6.0"
+        versionCode = 10
+        versionName = "0.6.1"
     }
 
     // Use the same private keystore in every CI build once the repository
