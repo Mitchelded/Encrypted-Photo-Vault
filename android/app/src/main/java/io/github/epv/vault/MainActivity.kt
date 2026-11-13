@@ -40,6 +40,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -75,6 +76,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme {
                 val scanStore = remember { NsfwProgressStore(this@MainActivity) }
+                val moveQueue = remember { NsfwFileQueue(this@MainActivity) }
                 var password by remember { mutableStateOf("") }
                 var sharedUris by remember { mutableStateOf(incomingSharedUris(intent)) }
                 var busy by remember { mutableStateOf(false) }
@@ -86,6 +88,8 @@ class MainActivity : ComponentActivity() {
                 var moveDestination by remember { mutableStateOf(scanStore.lastMoveTarget()) }
                 var moveJob by remember { mutableStateOf<Job?>(null) }
                 var moveCheckpoint by remember { mutableLongStateOf(0L) }
+                var movePending by remember { mutableLongStateOf(0L) }
+                var moveTotal by remember { mutableLongStateOf(0L) }
                 var confirmMove by remember { mutableStateOf(false) }
                 var status by remember { mutableStateOf("Готово к работе. Данные не отправляются на сторонние серверы.") }
                 var galleryUri by remember { mutableStateOf<Uri?>(null) }
@@ -184,20 +188,27 @@ class MainActivity : ComponentActivity() {
                     }
                     moveJob = scope.launch {
                         busy = true
-                        status = "Ищу 18+ в исходной папке..."
+                        status = "Открываю сохранённую очередь 18+..."
                         try {
                             val result = withContext(Dispatchers.IO) {
                                 val context = currentCoroutineContext()
-                                LocalNsfwClassifier(this@MainActivity).use { classifier ->
+                                // The 17 MB model is loaded only AFTER indexing,
+                                // when the first image actually needs inference.
+                                val classifier = lazy(LazyThreadSafetyMode.NONE) {
+                                    LocalNsfwClassifier(this@MainActivity)
+                                }
+                                try {
                                     NsfwOrganizer(this@MainActivity).moveFolder(
                                         sourceUri = src,
                                         destinationUri = dst,
                                         threshold = threshold,
+                                        scanId = scanId,
+                                        queue = moveQueue,
                                         score = { uri ->
                                             context.ensureActive()
-                                            val score = classifier.scoreMedia(uri)
+                                            val prediction = classifier.value.scoreMedia(uri)
                                             context.ensureActive()
-                                            score
+                                            prediction
                                         },
                                         alreadyChecked = { uri, length, modified ->
                                             scanStore.alreadyScanned(scanId, uri, length, modified)
@@ -206,19 +217,28 @@ class MainActivity : ComponentActivity() {
                                             scanStore.markScanned(scanId, uri, length, modified)
                                         },
                                         cancelled = { context.ensureActive() },
+                                        onIndexing = { stage, count ->
+                                            runOnUiThread {
+                                                if (moveJob?.isActive == true) {
+                                                    status = "$stage: найдено $count файлов..."
+                                                }
+                                            }
+                                        },
                                         onProgress = { index, total, filename ->
                                             runOnUiThread {
                                                 if (moveJob?.isActive == true) {
-                                                    status = "Перенос 18+: $index/$total — $filename"
+                                                    status = "Проверка/перенос 18+: $index/$total — $filename"
                                                 }
                                             }
                                         }
                                     )
+                                } finally {
+                                    if (classifier.isInitialized()) classifier.value.close()
                                 }
                             }
-                            moveCheckpoint = withContext(Dispatchers.IO) {
-                                scanStore.completedCount(scanId)
-                            }
+                            moveCheckpoint = moveQueue.done(scanId)
+                            movePending = moveQueue.pending(scanId)
+                            moveTotal = moveQueue.total(scanId)
                             status = "Сортировка завершена: перемещено ${result.moved}, " +
                                 "оставлено в исходной папке ${result.safe}, " +
                                 "уже проверено ${result.previouslyChecked}, " +
@@ -231,7 +251,11 @@ class MainActivity : ComponentActivity() {
                             status = "Ошибка сортировки: ${e.localizedMessage}. " +
                                 "Обработанные файлы останутся в истории."
                         } finally {
-                            moveCheckpoint = scanStore.completedCount(scanId)
+                            withContext(NonCancellable + Dispatchers.IO) {
+                                moveCheckpoint = moveQueue.done(scanId)
+                                movePending = moveQueue.pending(scanId)
+                                moveTotal = moveQueue.total(scanId)
+                            }
                             moveJob = null
                             busy = false
                         }
@@ -240,8 +264,17 @@ class MainActivity : ComponentActivity() {
                 LaunchedEffect(moveSource, moveDestination, nsfwThreshold) {
                     val src = moveSource
                     val dst = moveDestination
-                    moveCheckpoint = if (src == null || dst == null) 0 else withContext(Dispatchers.IO) {
-                        scanStore.completedCount(scanStore.moveScanId(src, dst, nsfwThreshold))
+                    if (src == null || dst == null) {
+                        moveCheckpoint = 0L
+                        movePending = 0L
+                        moveTotal = 0L
+                    } else {
+                        withContext(Dispatchers.IO) {
+                            val id = scanStore.moveScanId(src, dst, nsfwThreshold)
+                            moveCheckpoint = moveQueue.done(id)
+                            movePending = moveQueue.pending(id)
+                            moveTotal = moveQueue.total(id)
+                        }
                     }
                 }
                 LaunchedEffect(nsfwTarget, nsfwThreshold) {
@@ -705,7 +738,8 @@ class MainActivity : ComponentActivity() {
                             modifier = Modifier.fillMaxWidth()) { Text("Выбрать папку для 18+") }
                         if (moveSource != null && moveDestination != null) {
                             Text("Порог: ${(nsfwThreshold * 100).toInt()}%. " +
-                                 "Ранее проверено для этого режима: $moveCheckpoint",
+                                 "Очередь: $moveCheckpoint из $moveTotal обработано, " +
+                                 "$movePending осталось. История сохраняется.",
                                  style = MaterialTheme.typography.bodySmall)
                             Button(
                                 onClick = { confirmMove = true },
@@ -718,9 +752,13 @@ class MainActivity : ComponentActivity() {
                                 onClick = {
                                     val src = moveSource ?: return@TextButton
                                     val dst = moveDestination ?: return@TextButton
-                                    scanStore.clear(scanStore.moveScanId(src, dst, nsfwThreshold))
+                                    val id = scanStore.moveScanId(src, dst, nsfwThreshold)
+                                    scanStore.clear(id)
+                                    moveQueue.clear(id)
                                     moveCheckpoint = 0L
-                                    status = "История сортировки сброшена: при запуске проверю все файлы."
+                                    movePending = 0L
+                                    moveTotal = 0L
+                                    status = "Очередь сброшена: при запуске создам новый список файлов."
                                 }
                             ) { Text("Сбросить историю сортировки") }
                         }
@@ -732,6 +770,10 @@ class MainActivity : ComponentActivity() {
                                     containerColor = MaterialTheme.colorScheme.error)
                             ) { Text("■ Остановить перенос") }
                         }
+                        Text("При первом запуске создаётся очередь файлов. При продолжении список " +
+                             "не пересканируется: проверяются только оставшиеся. После завершения " +
+                             "однократно ищутся новые или изменённые файлы.",
+                             style = MaterialTheme.typography.bodySmall)
                         Text("Если Android запретит удаление, проверенная копия останется в новой папке, " +
                              "а оригинал — в исходной. Google Фото в облаке этот режим не перемещает.",
                              style = MaterialTheme.typography.bodySmall)
