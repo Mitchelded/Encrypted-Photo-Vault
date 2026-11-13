@@ -48,7 +48,7 @@ class VaultRepository(private val context: Context) {
         require(segments.size <= 32) { "Too many nested folders" }
         return segments.joinToString("/") { segment ->
             require(segment.isNotEmpty() && segment != "." && segment != "..") { "Unsafe folder path" }
-            val clean = segment.replace(Regex("[<>:\\"\\\\|?*\\x00-\\x1f]"), "_").trim(' ', '.')
+            val clean = segment.replace(Regex("""[<>:"\\\\|?*\x00-\x1f]"""), "_").trim(' ', '.')
             require(clean.isNotEmpty() && clean != "." && clean != "..") { "Unsafe folder name" }
             clean.take(120)
         }.also { require(it.length <= 1024) { "Folder path too long" } }
