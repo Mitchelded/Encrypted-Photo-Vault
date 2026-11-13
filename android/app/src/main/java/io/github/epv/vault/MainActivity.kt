@@ -54,6 +54,20 @@ import kotlinx.coroutines.ensureActive
  * where Pixel's Google Photos can back them up after the device folder is enabled.
  */
 class MainActivity : ComponentActivity() {
+    @Suppress("DEPRECATION")
+    private fun incomingSharedUris(shared: Intent?): List<Uri> {
+        if (shared?.action != Intent.ACTION_SEND &&
+            shared?.action != Intent.ACTION_SEND_MULTIPLE) return emptyList()
+        val streams = mutableListOf<Uri>()
+        shared.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)?.let(streams::add)
+        shared.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)?.let(streams::addAll)
+        shared.clipData?.let { clip ->
+            for (index in 0 until clip.itemCount)
+                clip.getItemAt(index).uri?.let(streams::add)
+        }
+        return streams.distinct().filter { it.scheme == "content" }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val repo = VaultRepository(this)
@@ -61,6 +75,7 @@ class MainActivity : ComponentActivity() {
             MaterialTheme {
                 val scanStore = remember { NsfwProgressStore(this@MainActivity) }
                 var password by remember { mutableStateOf("") }
+                var sharedUris by remember { mutableStateOf(incomingSharedUris(intent)) }
                 var busy by remember { mutableStateOf(false) }
                 var nsfwThreshold by remember { mutableFloatStateOf(scanStore.lastThreshold()) }
                 var nsfwTarget by remember { mutableStateOf(scanStore.lastFolder()) }
@@ -151,6 +166,13 @@ class MainActivity : ComponentActivity() {
                     nsfwCheckpoint = if (target == null) 0L else withContext(Dispatchers.IO) {
                         scanStore.completedCount(scanStore.scanId(target, nsfwThreshold))
                     }
+                }
+                LaunchedEffect(Unit) {
+                    when (intent?.getStringExtra("epv_launch")) {
+                        "cloud" -> status = "Google Фото: введите пароль и нажмите «Выбрать зашифрованные PNG из Google Фото»"
+                        "nsfw" -> status = "Поиск 18+: введите пароль, затем выберите папку или продолжите сканирование"
+                    }
+                    intent?.removeExtra("epv_launch")
                 }
                 val encryptPicker = rememberLauncherForActivityResult(
                     ActivityResultContracts.OpenMultipleDocuments()
@@ -360,6 +382,38 @@ class MainActivity : ComponentActivity() {
                              style = MaterialTheme.typography.bodySmall)
                         HorizontalDivider()
                         Text("Зашифровать", style = MaterialTheme.typography.titleLarge)
+                        if (sharedUris.isNotEmpty()) {
+                            Text("Получено из Google Фото / «Поделиться»: ${sharedUris.size} файл(ов). " +
+                                 "Нажмите кнопку для шифрования. Исходники не удаляются.",
+                                style = MaterialTheme.typography.bodyMedium)
+                            Button(
+                                enabled = !busy && password.isNotEmpty(),
+                                modifier = Modifier.fillMaxWidth(),
+                                onClick = {
+                                    val currentPassword = password
+                                    val selected = sharedUris
+                                    scope.launch {
+                                        busy = true
+                                        try {
+                                            var pngCount = 0
+                                            withContext(Dispatchers.IO) {
+                                                for ((index, source) in selected.withIndex()) {
+                                                    pngCount += repo.encryptOne(source, currentPassword, { part, count ->
+                                                        runOnUiThread {
+                                                            status = "Из Google Фото: ${index + 1}/${selected.size}, PNG $part/$count"
+                                                        }
+                                                    })
+                                                }
+                                            }
+                                            sharedUris = emptyList()
+                                            status = "Избранные файлы зашифрованы: ${selected.size} → $pngCount PNG"
+                                        } catch (t: Throwable) {
+                                            status = "Ошибка шифрования из Google Фото: ${t.localizedMessage}"
+                                        } finally { busy = false }
+                                    }
+                                }
+                            ) { Text("Зашифровать полученные через «Поделиться»") }
+                        }
                         Text("Выберите фото, видео или другие файлы. PNG сохранятся в Pictures/EncryptedPhotoVault. " +
                              "Эту папку можно перенести на Pixel XL для загрузки в Google Фото.")
                         Button(
