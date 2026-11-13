@@ -226,7 +226,9 @@ class NsfwOrganizer(private val context: Context) {
 
         // If the process was killed during first indexing, the flag remains
         // false. A resumed scan upserts already-indexed files without duplicates.
-        if (!queue.isInitialized(scanId)) {
+        val firstIndex = !queue.isInitialized(scanId)
+        val resumePending = queue.pending(scanId) > 0
+        if (firstIndex) {
             discover("Первичная индексация")
             cancelled()
             queue.setInitialized(scanId)
@@ -336,11 +338,14 @@ class NsfwOrganizer(private val context: Context) {
         drain()
         cancelled()
 
-        // Exactly one refresh after the existing queue is exhausted. In the
-        // common "mostly moved" case this directory tree is much smaller.
-        discover("Поиск новых файлов")
-        cancelled()
-        drain()
+        // No second 10k-file full scan immediately after initial indexing
+        // or after a resumed interrupted queue. A later user-triggered run,
+        // when no pending work exists, performs one refresh to find new media.
+        if (!firstIndex && !resumePending) {
+            discover("Поиск новых файлов")
+            cancelled()
+            drain()
+        }
 
         return Result(
             total = queue.total(scanId).toInt(),
