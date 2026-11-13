@@ -65,10 +65,10 @@ class MainActivity : ComponentActivity() {
                                     withContext(Dispatchers.Main) {
                                         status = "Шифрование ${index + 1}/${files.size}: $filename"
                                     }
-                                    total += repo.encryptOne(file, currentPassword) { n, count ->
+                                    total += repo.encryptOne(file, currentPassword, { n, count ->
                                         // Progress is intentionally throttled to one update per PNG.
                                         runOnUiThread { status = "Файл ${index + 1}/${files.size}, часть $n/$count" }
-                                    }
+                                    })
                                 }
                             }
                             status = "Готово: ${files.size} файлов → $total PNG. Папка Pictures/EncryptedPhotoVault"
