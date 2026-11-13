@@ -3,6 +3,7 @@ package io.github.epv.vault
 import android.content.Context
 import android.net.Uri
 import android.provider.DocumentsContract
+import android.provider.DocumentsContract.Document
 import androidx.documentfile.provider.DocumentFile
 import java.security.MessageDigest
 import java.util.concurrent.CancellationException
@@ -152,8 +153,12 @@ class NsfwOrganizer(private val context: Context) {
         )
 
         fun discover(stage: String): Int {
+            // Use one DocumentsProvider cursor per DIRECTORY rather than
+            // DocumentFile.isFile/name/length/lastModified per IMAGE.
+            // For 10,000 images this removes tens of thousands of IPC calls.
             val visited = HashSet<String>()
-            val batch = ArrayList<NsfwFileQueue.Entry>(160)
+            val batch = ArrayList<NsfwFileQueue.Entry>(400)
+            val rootDocId = DocumentsContract.getTreeDocumentId(sourceUri)
             var scanned = 0
             var added = 0
 
@@ -164,44 +169,56 @@ class NsfwOrganizer(private val context: Context) {
                 batch.clear()
             }
 
-            fun walk(dir: DocumentFile, relative: List<String>, depth: Int) {
+            val fields = arrayOf(
+                Document.COLUMN_DOCUMENT_ID,
+                Document.COLUMN_DISPLAY_NAME,
+                Document.COLUMN_MIME_TYPE,
+                Document.COLUMN_SIZE,
+                Document.COLUMN_LAST_MODIFIED
+            )
+            fun walk(documentId: String, relative: List<String>, depth: Int) {
                 cancelled()
                 require(depth <= 32) { "More than 32 nested directories" }
-                if (!visited.add(dir.uri.toString())) return
-                for (child in dir.listFiles()) {
-                    cancelled()
-                    if (child.isDirectory) {
-                        // If the destination is inside the source tree, do not
-                        // add our newly moved files back into the work queue.
-                        if (child.uri == target.uri ||
-                            (sameProvider && targetDocumentId != null &&
-                                documentId(child.uri) == targetDocumentId)) continue
-                        val name = child.name.orEmpty()
-                        if (name.isBlank() || name == "." || name == "..") continue
-                        walk(child, relative + name, depth + 1)
-                    } else if (child.isFile) {
-                        val filename = child.name.orEmpty()
-                        if (encodedPng.matches(filename)) continue
-                        val extension = filename.substringAfterLast('.', "").lowercase()
-                        // Avoid a slow ContentResolver.getType IPC for extensions
-                        // that are known media types.
-                        val isMedia = extension in knownExtensions ||
-                            (resolver.getType(child.uri)?.let {
-                                it.startsWith("image/") || it.startsWith("video/")
-                            } == true)
-                        if (!isMedia) continue
-                        require(scanned < 100_000) { "100,000-file limit exceeded" }
-                        batch.add(NsfwFileQueue.Entry(
-                            child.uri, relative, child.length(), child.lastModified()))
-                        scanned++
-                        if (batch.size >= 160) flush()
-                        if (scanned == 1 || scanned % 100 == 0) onIndexing(stage, scanned)
+                if (!visited.add(documentId)) return
+                val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(
+                    sourceUri, documentId)
+                resolver.query(childrenUri, fields, null, null, null)?.use { cursor ->
+                    val idIndex = cursor.getColumnIndexOrThrow(Document.COLUMN_DOCUMENT_ID)
+                    val nameIndex = cursor.getColumnIndex(Document.COLUMN_DISPLAY_NAME)
+                    val mimeIndex = cursor.getColumnIndex(Document.COLUMN_MIME_TYPE)
+                    val sizeIndex = cursor.getColumnIndex(Document.COLUMN_SIZE)
+                    val modifiedIndex = cursor.getColumnIndex(Document.COLUMN_LAST_MODIFIED)
+                    while (cursor.moveToNext()) {
+                        cancelled()
+                        val id = cursor.getString(idIndex) ?: continue
+                        val name = if (nameIndex >= 0) cursor.getString(nameIndex).orEmpty() else ""
+                        val mime = if (mimeIndex >= 0) cursor.getString(mimeIndex).orEmpty() else ""
+                        if (mime == Document.MIME_TYPE_DIR) {
+                            if (id == targetDocumentId && sameProvider) continue
+                            if (name.isBlank() || name == "." || name == "..") continue
+                            walk(id, relative + name, depth + 1)
+                        } else {
+                            if (encodedPng.matches(name)) continue
+                            val extension = name.substringAfterLast('.', "").lowercase()
+                            if (extension !in knownExtensions &&
+                                !mime.startsWith("image/") && !mime.startsWith("video/")) continue
+                            require(scanned < 100_000) { "100,000-file limit exceeded" }
+                            val size = if (sizeIndex >= 0 && !cursor.isNull(sizeIndex))
+                                cursor.getLong(sizeIndex) else 0L
+                            val modified = if (modifiedIndex >= 0 && !cursor.isNull(modifiedIndex))
+                                cursor.getLong(modifiedIndex) else 0L
+                            val uri = DocumentsContract.buildDocumentUriUsingTree(sourceUri, id)
+                            batch.add(NsfwFileQueue.Entry(uri, relative, size, modified))
+                            scanned++
+                            if (batch.size >= 400) flush()
+                            if (scanned == 1 || scanned % 250 == 0) onIndexing(stage, scanned)
+                        }
                     }
-                }
+                } ?: error("Cannot enumerate folder: $documentId")
             }
 
             onIndexing(stage, 0)
-            walk(sourceRoot, emptyList(), 0)
+            walk(rootDocId, emptyList(), 0)
             flush()
             onIndexing(stage, scanned)
             return added
