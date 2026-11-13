@@ -13,7 +13,7 @@ py -3.12 -m venv .venv-epv
 .\.venv-epv\Scripts\python.exe -m pip install -r pc_nsfw\requirements.txt
 adb devices
 adb reverse tcp:8765 tcp:8765
-.\.venv-epv\Scripts\python.exe pc_nsfw\epv_server.py --workers 4
+.\.venv-epv\Scripts\python.exe pc_nsfw\epv_server.py --workers 6
 ~~~
 
 Можно использовать скрипт `pc_nsfw/start_windows.ps1`. Он выводит список устройств ADB, открывает USB-порт и запускает сервер.
@@ -22,7 +22,7 @@ adb reverse tcp:8765 tcp:8765
 
 ## Параметры
 
-- `--workers 4`: количество независимых ML-потоков на CPU (1–8). Для Ryzen 5 8400F 4 — разумное начало.
+- `--workers 6`: количество независимых ML-потоков на CPU (1–8). Для Ryzen 5 8400F 4 — разумное начало.
 - `--port 8765`: порт; телефон использует только `127.0.0.1:8765`.
 - `--token YOUR_TOKEN`: постоянный токен длиной от 12 символов вместо случайного кода.
 - `--model FILE`: файл модели, SHA-256 которого должен соответствовать строго `380f98f7685f9d8a386f8cc595b6dfcb972989aae3d1b8b270d3a4a5b96fab40`.
